@@ -71,7 +71,9 @@ jobs:
           LEVIK_REQUIRE_NOTARIZATION: '1'
       - name: Build locally signed installer
         if: env.CSC_LINK == ''
-        run: npx electron-builder --mac dmg zip --${{ matrix.arch }} --config.mac.identity=- --config.mac.entitlements=build/entitlements.local.plist --config.mac.entitlementsInherit=build/entitlements.local.plist --publish never
+        # Missing GitHub secrets expand to empty strings; electron-builder treats
+        # an empty CSC_LINK as a certificate path. Omit it for ad-hoc signing.
+        run: env -u CSC_LINK -u CSC_KEY_PASSWORD npx electron-builder --mac dmg zip --${{ matrix.arch }} --config.mac.identity=- --config.mac.entitlements=build/entitlements.local.plist --config.mac.entitlementsInherit=build/entitlements.local.plist --publish never
       - name: Verify bundle
         shell: bash
         run: |

@@ -1,0 +1,123 @@
+name: macOS build and release
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    env:
+      LEVIK_BUILD_ARCH: ${{ matrix.arch }}
+      CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+      CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Assign version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF#refs/tags/v}"
+          else
+            version=$(node -e 'const p=require("./package.json").version.split(".").map(Number);p[2]+=Number(process.env.GITHUB_RUN_NUMBER);process.stdout.write(p.join("."))')
+          fi
+          npm version --no-git-tag-version --allow-same-version "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - run: npm run download:xray
+      - run: npm run lint
+      - run: npm run build
+      - run: npm test
+      - name: Prepare Apple notarization
+        if: env.CSC_LINK != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$APPLE_ID" && test -n "$APPLE_APP_SPECIFIC_PASSWORD" && test -n "$APPLE_TEAM_ID"
+          xcrun notarytool store-credentials levik-notary --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD"
+      - name: Build signed and notarized release
+        if: env.CSC_LINK != ''
+        run: npx electron-builder --mac dmg zip --${{ matrix.arch }} --publish never
+        env:
+          LEVIK_REQUIRE_NOTARIZATION: '1'
+      - name: Build locally signed installer
+        if: env.CSC_LINK == ''
+        run: npx electron-builder --mac dmg zip --${{ matrix.arch }} --config.mac.identity=- --config.mac.entitlements=build/entitlements.local.plist --config.mac.entitlementsInherit=build/entitlements.local.plist --publish never
+      - name: Verify bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle=$(find release -maxdepth 2 -name 'Levik VPN.app' -print -quit)
+          codesign --verify --deep --strict --verbose=2 "$bundle"
+          "$bundle/Contents/Resources/native/levik-helper" --self-test
+          "$bundle/Contents/Resources/xray/xray" version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: |
+            release/*.dmg
+            release/*.zip
+          if-no-files-found: error
+          retention-days: 14
+  release:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: macos-*
+          merge-multiple: true
+          path: release
+      - run: node scripts/release-manifest.mjs release '${{ needs.build.outputs.version }}'
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.build.outputs.version }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            test "$(gh release view "$tag" --json isDraft --jq .isDraft)" = true || { echo 'Refusing to overwrite a published release'; exit 1; }
+            gh release upload "$tag" release/* --clobber
+            gh release edit "$tag" --draft=false
+          else
+            gh release create "$tag" release/* --target "$COMMIT_SHA" --title "Levik VPN для macOS $VERSION" --generate-notes
+          fi

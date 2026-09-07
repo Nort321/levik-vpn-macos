@@ -1,0 +1,107 @@
+{
+  "name": "levik-vpn-macos",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Official Levik VPN client for macOS",
+  "main": "dist/main/main.js",
+  "author": "Levik VPN",
+  "license": "AGPL-3.0-only",
+  "scripts": {
+    "lint": "tsc --noEmit",
+    "build": "node scripts/build.mjs && node scripts/build-native.mjs",
+    "test": "vitest run",
+    "download:xray": "node scripts/download-xray.mjs",
+    "package:mac": "npm run build && electron-builder --mac dmg zip --publish never",
+    "check": "npm run lint && npm run build && npm test",
+    "package:local": "npm run build && electron-builder --mac dmg zip --publish never --config.mac.identity=- --config.mac.entitlements=build/entitlements.local.plist --config.mac.entitlementsInherit=build/entitlements.local.plist"
+  },
+  "devDependencies": {
+    "electron": "44.0.0",
+    "electron-builder": "26.15.3",
+    "esbuild": "0.25.10",
+    "typescript": "5.9.2",
+    "vitest": "3.2.7"
+  },
+  "build": {
+    "appId": "com.leviknet.vpn.macos",
+    "productName": "Levik VPN",
+    "artifactName": "LevikVPN-macOS-${version}-${arch}.${ext}",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "vendor/xray/darwin-${arch}",
+        "to": "xray",
+        "filter": [
+          "xray",
+          "geoip.dat",
+          "geosite.dat",
+          "LICENSE",
+          "VERSION"
+        ]
+      },
+      {
+        "from": "build/native/${arch}",
+        "to": "native",
+        "filter": [
+          "levik-helper"
+        ]
+      }
+    ],
+    "asar": true,
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "category": "public.app-category.utilities",
+      "icon": "build/icon.icns",
+      "minimumSystemVersion": "13.0",
+      "hardenedRuntime": true,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "extendInfo": {
+        "NSHumanReadableCopyright": "Copyright \u00a9 Levik VPN. AGPL-3.0-only."
+      },
+      "notarize": false,
+      "binaries": [
+        "Contents/Resources/native/levik-helper",
+        "Contents/Resources/xray/xray"
+      ]
+    },
+    "dmg": {
+      "title": "Levik VPN",
+      "window": {
+        "width": 540,
+        "height": 380
+      },
+      "contents": [
+        {
+          "x": 145,
+          "y": 170
+        },
+        {
+          "x": 395,
+          "y": 170,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ]
+    },
+    "afterSign": "scripts/notarize.mjs",
+    "publish": [
+      {
+        "provider": "generic",
+        "url": "https://github.com/Nort321/levik-vpn-macos/releases/latest/download"
+      }
+    ]
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.9"
+  }
+}

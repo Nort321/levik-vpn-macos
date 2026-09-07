@@ -1,0 +1,13 @@
+node_modules/
+dist/
+release/
+vendor/
+build/native/
+build/icon.iconset/
+build/icon.icns
+.DS_Store
+.env*
+*.p12
+*.p8
+*.key
+coverage/

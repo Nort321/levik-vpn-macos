@@ -1,0 +1,47 @@
+{
+  "version": "1.0.0",
+  "at": "2026-09-07T14:31:05.548Z",
+  "finished": true,
+  "results": [
+    {
+      "name": "direct-baseline",
+      "passed": true,
+      "detail": "curl=0"
+    },
+    {
+      "name": "https-ipv4-tunnel",
+      "passed": true,
+      "detail": "curl=0; exit IP differs from baseline"
+    },
+    {
+      "name": "https-ipv6-tunnel",
+      "passed": true,
+      "detail": "curl=0"
+    },
+    {
+      "name": "udp-dns-through-tunnel",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "physical-router-dns-blocked",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "physical-dns-packet-capture",
+      "passed": true,
+      "detail": "outbound DNS/DoT packets=0"
+    },
+    {
+      "name": "existing-pf-rules-preserved",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "settings-and-connection-restored",
+      "passed": true,
+      "detail": ""
+    }
+  ]
+}

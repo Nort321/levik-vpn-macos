@@ -1,0 +1,112 @@
+{
+  "version": "1.0.0",
+  "at": "2026-09-07T14:25:06.089Z",
+  "finished": true,
+  "results": [
+    {
+      "name": "direct-baseline",
+      "passed": true,
+      "detail": "curl=0"
+    },
+    {
+      "name": "https-ipv4-tunnel",
+      "passed": true,
+      "detail": "curl=0; exit IP differs from baseline"
+    },
+    {
+      "name": "https-ipv6-tunnel",
+      "passed": true,
+      "detail": "curl=0"
+    },
+    {
+      "name": "udp-dns-through-tunnel",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "physical-router-dns-blocked",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "physical-dns-packet-capture",
+      "passed": false,
+      "detail": "outbound DNS/DoT packets=1"
+    },
+    {
+      "name": "enable-kill-switch-while-connected",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "https-with-kill-switch",
+      "passed": true,
+      "detail": "curl=0"
+    },
+    {
+      "name": "physical-https-blocked",
+      "passed": true,
+      "detail": "curl=28; direct baseline succeeded"
+    },
+    {
+      "name": "core-exit-retains-kill-switch",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "core-exit-no-ipv4-escape",
+      "passed": true,
+      "detail": "curl=28"
+    },
+    {
+      "name": "core-exit-no-ipv6-escape",
+      "passed": true,
+      "detail": "curl=7"
+    },
+    {
+      "name": "disconnect-restores-network",
+      "passed": true,
+      "detail": "curl=0"
+    },
+    {
+      "name": "automatic-reconnect-after-sigkill",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "reconnect-byte-counts-monotonic",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "process-routing-bypass",
+      "passed": true,
+      "detail": "curl=0"
+    },
+    {
+      "name": "process-routing-only",
+      "passed": true,
+      "detail": "curl=0"
+    },
+    {
+      "name": "routing-bypassRu",
+      "passed": true,
+      "detail": "curl=0"
+    },
+    {
+      "name": "routing-blockedOnly",
+      "passed": true,
+      "detail": "curl=0"
+    },
+    {
+      "name": "existing-pf-rules-preserved",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "name": "settings-and-connection-restored",
+      "passed": true,
+      "detail": ""
+    }
+  ]
+}

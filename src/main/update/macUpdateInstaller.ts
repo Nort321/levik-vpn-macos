@@ -1,8 +1,8 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { execFile } from "node:child_process";
-import { createReadStream } from "node:fs";
-import { access, lstat, mkdir, mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
-import { constants } from "node:fs";
+import { constants, createReadStream, promises as nodeFileSystemPromises } from "node:fs";
+import { access, lstat, mkdir, mkdtemp, readFile, realpath, stat } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { basename, extname, join } from "node:path";
 import { promisify } from "node:util";
 import { app } from "electron";
@@ -10,8 +10,11 @@ import type { UpdateFileInfo, UpdateInfo } from "electron-updater";
 import { ADMIN_LAUNCH_SCRIPT, quoteShellArgument } from "../macos/helperClient";
 
 const execute = promisify(execFile);
+const requireRuntimeModule = createRequire(__filename);
 const APP_NAME = "Levik VPN.app";
 const APP_IDENTIFIER = "com.leviknet.vpn.macos";
+const INSTALLER_READY_TIMEOUT_MS = 180_000;
+const INSTALLER_POLL_INTERVAL_MS = 100;
 
 export interface DownloadedMacUpdate {
   archivePath: string;
@@ -61,7 +64,11 @@ export async function prepareMacUpdate(update: DownloadedMacUpdate): Promise<Pre
     await access(join(bundlePath, "Contents", "MacOS", "Levik VPN"), constants.X_OK);
     return { ...update, bundlePath, stagingRoot };
   } catch (error) {
-    await rm(stagingRoot, { recursive: true, force: true });
+    try {
+      await removeStagingRoot(stagingRoot);
+    } catch (cleanupError) {
+      console.error("Failed to clean rejected macOS update staging", cleanupError);
+    }
     throw error;
   }
 }
@@ -83,21 +90,36 @@ export async function launchMacUpdateInstaller(update: PreparedMacUpdate): Promi
   } catch {
     throw new Error("Разрешение macOS не получено. Подтвердите установку обновления.");
   }
-  for (let attempt = 0; attempt < 150; attempt++) {
-    try {
-      if ((await readFile(readyPath, "utf8")).trim() === "ready") return;
-    } catch {
-      // The privileged helper creates the marker after validating every path.
-    }
-    await new Promise((resolve) => setTimeout(resolve, 100));
+  const deadline = Date.now() + INSTALLER_READY_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const status = await readOptionalText(readyPath);
+    if (status === "ready") return;
+    if (status?.startsWith("error\n")) throw new Error(status.slice("error\n".length).trim() || "Системный установщик обновления завершился с ошибкой");
+    const detail = await readOptionalText(outputPath);
+    if (detail) throw new Error(detail);
+    await new Promise((resolve) => setTimeout(resolve, INSTALLER_POLL_INTERVAL_MS));
   }
-  let detail = "";
-  try { detail = (await readFile(outputPath, "utf8")).trim(); } catch { /* no helper output */ }
+  const detail = await readOptionalText(outputPath);
   throw new Error(detail || "Системный установщик обновления не запустился");
 }
 
 export async function cleanupPreparedMacUpdate(update: PreparedMacUpdate): Promise<void> {
-  await rm(update.stagingRoot, { recursive: true, force: true });
+  await removeStagingRoot(update.stagingRoot);
+}
+
+async function readOptionalText(path: string): Promise<string | null> {
+  try {
+    return (await readFile(path, "utf8")).trim();
+  } catch {
+    return null;
+  }
+}
+
+async function removeStagingRoot(stagingRoot: string): Promise<void> {
+  const fileSystem = process.versions.electron
+    ? (requireRuntimeModule("original-fs") as { promises: Pick<typeof nodeFileSystemPromises, "rm"> }).promises
+    : nodeFileSystemPromises;
+  await fileSystem.rm(stagingRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
 }
 
 function updateFileName(file: UpdateFileInfo): string | null {

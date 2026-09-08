@@ -313,6 +313,11 @@ func launchApplication(_ application: URL, uid: uid_t) throws {
     try require(result.0 == 0, "Не удалось перезапустить Levik VPN")
 }
 
+func writeUpdateMarker(_ value: String, to path: String) throws {
+    try Data((value + "\n").utf8).write(to: URL(fileURLWithPath: path), options: .atomic)
+    try require(chmod(path, 0o644) == 0, "Не удалось подтвердить готовность обновления")
+}
+
 func installUpdate(parent: pid_t, stagedPath: String, expectedVersion: String, readyPath: String) throws {
     try require(getuid() == 0 && parent > 1 && validUpdateVersion(expectedVersion), "Некорректный запрос обновления")
     var parentExecutable = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
@@ -331,16 +336,15 @@ func installUpdate(parent: pid_t, stagedPath: String, expectedVersion: String, r
     try require(stagedApplication.path.hasPrefix(allowedRoot.path + "/") && marker == stagedApplication.deletingLastPathComponent().appendingPathComponent(".installer-ready"), "Некорректный путь обновления")
     var stagedInfo = stat()
     try require(lstat(stagedApplication.path, &stagedInfo) == 0 && (stagedInfo.st_mode & S_IFMT) == S_IFDIR && stagedInfo.st_uid == uid, "Небезопасный каталог обновления")
-    _ = try verifiedBundleHash(stagedApplication, expectedVersion: expectedVersion)
     let candidate = currentApplication.deletingLastPathComponent().appendingPathComponent(".Levik-VPN-update-\(UUID().uuidString).app")
     var swapped = false
     do {
+        _ = try verifiedBundleHash(stagedApplication, expectedVersion: expectedVersion)
         // Copy into the root-owned Applications directory before signalling
         // readiness. The user-writable staging tree is never trusted again.
         try FileManager.default.copyItem(at: stagedApplication, to: candidate)
         _ = try verifiedBundleHash(candidate, expectedVersion: expectedVersion)
-        try Data("ready\n".utf8).write(to: marker, options: .atomic)
-        chmod(marker.path, 0o644)
+        try writeUpdateMarker("ready", to: marker.path)
         let exitDeadline = Date().addingTimeInterval(120)
         while sameProcess(parent, started: parentStarted) && Date() < exitDeadline { Thread.sleep(forTimeInterval: 0.1) }
         try require(!sameProcess(parent, started: parentStarted), "Приложение не завершилось для установки")
@@ -361,6 +365,8 @@ func installUpdate(parent: pid_t, stagedPath: String, expectedVersion: String, r
         }
         try? FileManager.default.removeItem(at: candidate)
         if !sameProcess(parent, started: parentStarted) { try? launchApplication(currentApplication, uid: uid) }
+        let message = (error as? HelperError)?.description ?? "Системный установщик обновления завершился с ошибкой"
+        try? writeUpdateMarker("error\n\(message)", to: marker.path)
         throw error
     }
 }

@@ -115,4 +115,18 @@ describe("macOS OTA updater", () => {
     expect(installerMock.cleanupPreparedMacUpdate).toHaveBeenCalledOnce();
     expect(appMock.quit).not.toHaveBeenCalled();
   });
+
+  it("does not mask the installer failure when staging cleanup also fails", async () => {
+    const updater = new AppUpdater();
+    const cleanupLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    updaterMock.emit("update-available", { version: "1.2.8", files: [] });
+    await updater.download();
+    installerMock.launchMacUpdateInstaller.mockRejectedValueOnce(new Error("installer failed"));
+    installerMock.cleanupPreparedMacUpdate.mockRejectedValueOnce(new Error("cleanup failed"));
+
+    await expect(updater.install(async () => undefined, vi.fn())).rejects.toThrow("installer failed");
+    expect(cleanupLog).toHaveBeenCalledWith("Failed to clean prepared macOS update staging", expect.any(Error));
+    expect(updater.snapshot()).toEqual(expect.objectContaining({ status: "downloaded", progress: 100 }));
+    cleanupLog.mockRestore();
+  });
 });

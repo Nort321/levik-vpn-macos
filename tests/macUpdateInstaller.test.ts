@@ -1,10 +1,10 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { UpdateInfo } from "electron-updater";
-import { isSafeMacUpdateArchiveEntry, verifyDownloadedUpdate } from "../src/main/update/macUpdateInstaller";
+import { cleanupPreparedMacUpdate, isSafeMacUpdateArchiveEntry, verifyDownloadedUpdate } from "../src/main/update/macUpdateInstaller";
 
 const temporaryDirectories: string[] = [];
 
@@ -44,6 +44,24 @@ describe("custom macOS update verification", () => {
     await writeFile(archivePath, Buffer.from("tampered update archive"));
 
     await expect(verifyDownloadedUpdate([archivePath], info)).rejects.toThrow(/размер|сумма/);
+  });
+
+  it("removes a prepared application bundle containing app.asar", async () => {
+    const stagingRoot = await mkdtemp(join(tmpdir(), "levik-update-test-"));
+    temporaryDirectories.push(stagingRoot);
+    const resources = join(stagingRoot, "Levik VPN.app", "Contents", "Resources");
+    await mkdir(resources, { recursive: true });
+    await writeFile(join(resources, "app.asar"), "archive");
+
+    await cleanupPreparedMacUpdate({
+      archivePath: join(stagingRoot, "update.zip"),
+      version: "1.2.8",
+      sha512: "checksum",
+      bundlePath: join(stagingRoot, "Levik VPN.app"),
+      stagingRoot,
+    });
+
+    await expect(access(stagingRoot)).rejects.toMatchObject({ code: "ENOENT" });
   });
 });
 

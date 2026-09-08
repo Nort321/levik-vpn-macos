@@ -91,7 +91,13 @@ export class AppUpdater extends EventEmitter<AppUpdaterEvents> {
       beforeQuit();
       app.quit();
     } catch (error) {
-      if (preparedUpdate && !handedOff) await cleanupPreparedMacUpdate(preparedUpdate);
+      if (preparedUpdate && !handedOff) {
+        try {
+          await cleanupPreparedMacUpdate(preparedUpdate);
+        } catch (cleanupError) {
+          console.error("Failed to clean prepared macOS update staging", cleanupError);
+        }
+      }
       this.patch({ status: "downloaded", progress: 100, message: `Не удалось запустить установку: ${safeUpdateError(error)}` });
       throw error;
     }

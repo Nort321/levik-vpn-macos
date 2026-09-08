@@ -1,12 +1,8 @@
 import { app } from "electron";
-import { execFile } from "node:child_process";
 import { macHelper } from "../macos/helperClient";
 import { join } from "node:path";
 import { EventEmitter } from "node:events";
-import { promisify } from "node:util";
-import { parseXrayStats, XRAY_STATS_ENDPOINT } from "./xrayStats";
-
-const execFileAsync = promisify(execFile);
+import { XrayStatsClient } from "./xrayStats";
 
 interface XrayEvents {
   log: [line: string];
@@ -20,6 +16,8 @@ export class XrayManager extends EventEmitter<XrayEvents> {
   private statsTimer: ReturnType<typeof setInterval> | null = null;
   private statsQueryRunning = false;
   private statsErrorReported = false;
+  private statsGeneration = 0;
+  private readonly statsClient = new XrayStatsClient();
 
   async start(config: Record<string, unknown>): Promise<void> {
     this.stopping = true;
@@ -50,9 +48,7 @@ export class XrayManager extends EventEmitter<XrayEvents> {
   async isHealthy(): Promise<boolean> {
     if (!this.running) return false;
     try {
-      await execFileAsync(this.executablePath(), [
-        "api", "statsquery", `--server=${XRAY_STATS_ENDPOINT}`, "-pattern", "inbound>>>levik-tun-in>>>",
-      ], { windowsHide: true, timeout: 3_500, maxBuffer: 256 * 1024 });
+      await this.statsClient.query("inbound>>>levik-tun-in>>>");
       return this.running;
     } catch {
       return false;
@@ -75,40 +71,43 @@ export class XrayManager extends EventEmitter<XrayEvents> {
   private stopStatsPolling(): void {
     if (this.statsTimer) clearInterval(this.statsTimer);
     this.statsTimer = null;
+    this.statsGeneration += 1;
     this.statsQueryRunning = false;
+    this.statsClient.close();
   }
 
   private async queryStats(): Promise<void> {
     if (!this.running || this.statsQueryRunning) return;
     this.statsQueryRunning = true;
+    const generation = this.statsGeneration;
     try {
-      const status = await macHelper.status();
-      if (!status.running) {
-        this.running = false;
-        this.stopStatsPolling();
-        this.emit("exit", status.exitCode, this.stopping);
-        return;
-      }
-      const { stdout } = await execFileAsync(this.executablePath(), [
-        "api", "statsquery",
-        `--server=${XRAY_STATS_ENDPOINT}`,
-        "-pattern", "inbound>>>levik-tun-in>>>traffic>>>",
-      ], { windowsHide: true, timeout: 3_500, maxBuffer: 256 * 1024 });
-      const values = parseXrayStats(stdout);
+      const values = await this.statsClient.query("inbound>>>levik-tun-in>>>traffic>>>");
+      if (generation !== this.statsGeneration) return;
       this.statsErrorReported = false;
       if (this.running) this.emit("stats", values.downlink, values.uplink);
     } catch (error) {
-      if (!macHelper.connected && this.running) {
-        this.running = false;
-        this.stopStatsPolling();
-        this.emit("exit", null, this.stopping);
+      if (generation !== this.statsGeneration) return;
+      if (this.running) {
+        if (!macHelper.connected) {
+          this.running = false;
+          this.stopStatsPolling();
+          this.emit("exit", null, this.stopping);
+          return;
+        }
+        const status = await macHelper.status().catch(() => null);
+        if (status && !status.running) {
+          this.running = false;
+          this.stopStatsPolling();
+          this.emit("exit", status.exitCode, this.stopping);
+          return;
+        }
       }
       if (!this.statsErrorReported && this.running) {
         this.statsErrorReported = true;
         this.emit("log", `Статистика Xray: ${error instanceof Error ? error.message : "ошибка запроса"}`);
       }
     } finally {
-      this.statsQueryRunning = false;
+      if (generation === this.statsGeneration) this.statsQueryRunning = false;
     }
   }
 }

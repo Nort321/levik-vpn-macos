@@ -31,6 +31,7 @@
     },
     "files": [
       "dist/**/*",
+      "!dist/**/*.map",
       "package.json"
     ],
     "extraResources": [
@@ -54,6 +55,11 @@
       }
     ],
     "asar": true,
+    "compression": "maximum",
+    "electronLanguages": [
+      "en",
+      "ru"
+    ],
     "mac": {
       "target": [
         "dmg",

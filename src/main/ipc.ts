@@ -60,7 +60,10 @@ export function registerIpc(controller: AppController, window: BrowserWindow): v
   ipcMain.handle(IPC.downloadUpdate, () => controller.downloadUpdate());
   ipcMain.handle(IPC.installUpdate, () => controller.installUpdate());
   controller.on("changed", (snapshot) => {
-    if (!window.isDestroyed()) window.webContents.send(IPC.snapshotChanged, snapshot);
+    if (!window.isDestroyed() && window.isVisible()) window.webContents.send(IPC.snapshotChanged, snapshot);
+  });
+  window.on("show", () => {
+    if (!window.isDestroyed()) window.webContents.send(IPC.snapshotChanged, controller.snapshot());
   });
 }
 

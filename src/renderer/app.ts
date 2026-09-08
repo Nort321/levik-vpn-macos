@@ -35,11 +35,13 @@ window.levik.onSnapshot((snapshot) => {
   }
 });
 
-setInterval(() => {
+const sessionDurationTimer = setInterval(() => {
+  if (document.hidden) return;
   document.querySelectorAll<HTMLElement>("[data-session-duration]").forEach((element) => {
     element.textContent = formatDuration(sessionSeconds());
   });
 }, 1_000);
+window.addEventListener("pagehide", () => clearInterval(sessionDurationTimer), { once: true });
 
 function render(preserveScroll = true): void {
   const contentScrollTop = preserveScroll ? document.querySelector<HTMLElement>(".content")?.scrollTop ?? 0 : 0;

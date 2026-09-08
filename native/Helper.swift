@@ -25,29 +25,31 @@ func require(_ condition: Bool, _ message: String) throws {
 }
 
 func run(_ path: String, _ arguments: [String], input: Data? = nil, timeout: Double = 15) throws -> (Int32, String) {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: path)
-    process.arguments = arguments
-    process.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "en_US.UTF-8", "XRAY_LOCATION_ASSET": coreURL.deletingLastPathComponent().path]
-    let output = Pipe()
-    let incoming = Pipe()
-    process.standardOutput = output
-    process.standardError = output
-    process.standardInput = incoming
-    let completed = DispatchSemaphore(value: 0)
-    process.terminationHandler = { _ in completed.signal() }
-    try process.run()
-    if let input { incoming.fileHandleForWriting.write(input) }
-    try? incoming.fileHandleForWriting.close()
-    // Drain output concurrently so verbose child output cannot deadlock wait.
-    let collected = OutputCollector(output.fileHandleForReading)
-    collected.start()
-    if completed.wait(timeout: .now() + timeout) == .timedOut {
-        process.terminate()
-        if completed.wait(timeout: .now() + 2) == .timedOut { kill(process.processIdentifier, SIGKILL); process.waitUntilExit() }
-        throw HelperError("Системная операция превысила время ожидания")
+    try autoreleasepool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = arguments
+        process.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "en_US.UTF-8", "XRAY_LOCATION_ASSET": coreURL.deletingLastPathComponent().path, "GOMEMLIMIT": "64MiB"]
+        let output = Pipe()
+        let incoming = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        process.standardInput = incoming
+        let completed = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in completed.signal() }
+        try process.run()
+        if let input { incoming.fileHandleForWriting.write(input) }
+        try? incoming.fileHandleForWriting.close()
+        // Drain output concurrently so verbose child output cannot deadlock wait.
+        let collected = OutputCollector(output.fileHandleForReading)
+        collected.start()
+        if completed.wait(timeout: .now() + timeout) == .timedOut {
+            process.terminate()
+            if completed.wait(timeout: .now() + 2) == .timedOut { kill(process.processIdentifier, SIGKILL); process.waitUntilExit() }
+            throw HelperError("Системная операция превысила время ожидания")
+        }
+        return (process.terminationStatus, collected.finish())
     }
-    return (process.terminationStatus, collected.finish())
 }
 
 final class OutputCollector {
@@ -57,11 +59,12 @@ final class OutputCollector {
     init(_ handle: FileHandle) { self.handle = handle }
     func start() {
         DispatchQueue.global().async {
-            while true {
+            while autoreleasepool(invoking: {
                 let bytes = self.handle.availableData
-                if bytes.isEmpty { break }
+                if bytes.isEmpty { return false }
                 if self.data.count < 262144 { self.data.append(bytes.prefix(262144 - self.data.count)) }
-            }
+                return true
+            }) {}
             self.done.signal()
         }
     }
@@ -108,16 +111,17 @@ final class CoreDiagnostics {
     func drain(_ pipe: Pipe) {
         DispatchQueue.global().async {
             var buffer = Data()
-            while true {
+            while autoreleasepool(invoking: {
                 let data = pipe.fileHandleForReading.availableData
-                if data.isEmpty { break }
+                if data.isEmpty { return false }
                 buffer.append(data)
                 while let newline = buffer.firstIndex(of: 10) {
                     self.consume(String(decoding: buffer.prefix(upTo: newline), as: UTF8.self))
                     buffer.removeSubrange(...newline)
                 }
                 if buffer.count > 65536 { buffer.removeAll() }
-            }
+                return true
+            }) {}
         }
     }
 }
@@ -154,9 +158,9 @@ final class DNSAudit {
         DispatchQueue.global().async {
             defer { self.drained.signal() }
             var buffer = Data()
-            while true {
+            while autoreleasepool(invoking: {
                 let data = pipe.fileHandleForReading.availableData
-                if data.isEmpty { break }
+                if data.isEmpty { return false }
                 buffer.append(data)
                 while let newline = buffer.firstIndex(of: 10) {
                     let line = String(decoding: buffer.prefix(upTo: newline), as: UTF8.self)
@@ -164,7 +168,8 @@ final class DNSAudit {
                     buffer.removeSubrange(...newline)
                 }
                 if buffer.count > 65536 { buffer.removeAll() }
-            }
+                return true
+            }) {}
         }
         Thread.sleep(forTimeInterval: 0.2)
         try require(process.isRunning, "Захват DNS недоступен")
@@ -459,7 +464,7 @@ final class TunnelSession {
         let process = Process()
         process.executableURL = coreURL
         process.arguments = ["run", "-format", "json", "-config", "stdin:"]
-        process.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "XRAY_LOCATION_ASSET": coreURL.deletingLastPathComponent().path]
+        process.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "en_US.UTF-8", "XRAY_LOCATION_ASSET": coreURL.deletingLastPathComponent().path, "GOMEMLIMIT": "64MiB"]
         let input = Pipe()
         let output = Pipe()
         diagnostics = CoreDiagnostics()
@@ -622,23 +627,14 @@ func endpointHosts(_ value: Any) -> Set<String> {
 func resolveEndpoint(_ host: String) throws -> [String] {
     try require(host.range(of: "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$", options: .regularExpression) != nil, "Некорректное имя VPN-сервера")
     // Use an IP-literal HTTPS bootstrap so reconnect does not depend on a DNS
-    // resolver behind the stopped tunnel. Only VPN endpoint names are queried.
-    let url = URL(string: "https://1.1.1.1/dns-query?name=\(host)&type=A")!
-    var request = URLRequest(url: url, timeoutInterval: 8)
-    request.setValue("application/dns-json", forHTTPHeaderField: "Accept")
-    let session = URLSession(configuration: .ephemeral)
-    let semaphore = DispatchSemaphore(value: 0)
-    var result: [String] = []
-    let task = session.dataTask(with: request) { data, response, _ in
-        defer { semaphore.signal() }
-        guard (response as? HTTPURLResponse)?.statusCode == 200, let data,
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              object["Status"] as? Int == 0, let answers = object["Answer"] as? [[String: Any]] else { return }
-        result = answers.compactMap { $0["data"] as? String }.filter(isIP)
-    }
-    task.resume()
-    if semaphore.wait(timeout: .now() + 10) == .timedOut { task.cancel(); session.invalidateAndCancel(); throw HelperError("Не удалось определить адрес VPN-сервера") }
-    session.finishTasksAndInvalidate()
+    // resolver behind the stopped tunnel. curl keeps CFNetwork and its caches
+    // out of this long-lived privileged process.
+    let response = try run("/usr/bin/curl", ["--connect-timeout", "5", "--max-time", "8", "--silent", "--show-error", "--fail", "--header", "Accept: application/dns-json", "https://1.1.1.1/dns-query?name=\(host)&type=A"], timeout: 10)
+    guard response.0 == 0,
+          let object = try? JSONSerialization.jsonObject(with: Data(response.1.utf8)) as? [String: Any],
+          object["Status"] as? Int == 0,
+          let answers = object["Answer"] as? [[String: Any]] else { throw HelperError("Не удалось определить адрес VPN-сервера") }
+    let result = answers.compactMap { $0["data"] as? String }.filter(isIP)
     try require(!result.isEmpty, "Не удалось определить адрес VPN-сервера")
     return result
 }
@@ -702,52 +698,48 @@ func serve(parent: pid_t) throws {
         input.append(contentsOf: buffer.prefix(count))
         if input.count > 2 * 1024 * 1024 { break }
         while let newline = input.firstIndex(of: 10) {
-            let line = input.prefix(upTo: newline)
+            let line = Data(input.prefix(upTo: newline))
             input.removeSubrange(...newline)
             var id = 0
-            var response: [String: Any]
-            do {
-                guard let object = try JSONSerialization.jsonObject(with: line) as? [String: Any], let requestID = object["id"] as? Int, requestID > 0, let command = object["command"] as? String else { throw HelperError("Некорректный запрос") }
-                id = requestID
-                switch command {
-                case "start":
-                    guard let config = object["config"] as? [String: Any], let killSwitch = object["killSwitch"] as? Bool, let dns = object["dnsProtection"] as? Bool else { throw HelperError("Некорректный VPN-профиль") }
-                    if let dnsServer = object["dnsServer"] as? String { try require(isIP(dnsServer), "Некорректный DNS"); session.dnsServer = dnsServer }
-                    try session.start(config, killSwitch: killSwitch, dns: dns)
-                case "stop": try session.stop()
-                case "protection":
-                    guard let killSwitch = object["killSwitch"] as? Bool, let dns = object["dnsProtection"] as? Bool else { throw HelperError("Некорректные параметры защиты") }
-                    try session.protection(killSwitch: killSwitch, dns: dns)
-                case "status": break
-                case "audit-start":
-                    _ = session.dnsAudit?.stop()
-                    try require(session.child?.isRunning == true, "Для проверки нужен активный туннель")
-                    session.dnsAudit = try DNSAudit(interface: session.outboundInterface)
-                case "audit-stop":
-                    guard let audit = session.dnsAudit else { throw HelperError("Проверка DNS не запущена") }
-                    let packets = audit.stop(); session.dnsAudit = nil
-                    response = ["id": id, "result": ["physicalDNSPackets": packets]]
-                    var bytes = try JSONSerialization.data(withJSONObject: response); bytes.append(10)
-                    try FileHandle(fileDescriptor: accepted, closeOnDealloc: false).write(contentsOf: bytes)
-                    continue
-                case "audit-rules":
-                    let rules = try run("/sbin/pfctl", ["-sr"])
-                    try require(rules.0 == 0, "Не удалось прочитать правила PF")
-                    let digest = SHA256.hash(data: Data(rules.1.utf8)).map { String(format: "%02x", $0) }.joined()
-                    response = ["id": id, "result": ["rootRulesSHA256": digest]]
-                    var bytes = try JSONSerialization.data(withJSONObject: response); bytes.append(10)
-                    try FileHandle(fileDescriptor: accepted, closeOnDealloc: false).write(contentsOf: bytes)
-                    continue
-                case "abort-core":
-                    guard let child = session.child, child.isRunning else { throw HelperError("VPN-ядро не запущено") }
-                    kill(child.processIdentifier, SIGKILL)
-                    child.waitUntilExit()
-                case "shutdown": try session.disconnect(); session.shouldExit = true
-                default: throw HelperError("Неизвестная команда")
+            var response: [String: Any] = [:]
+            autoreleasepool {
+                do {
+                    guard let object = try JSONSerialization.jsonObject(with: line) as? [String: Any], let requestID = object["id"] as? Int, requestID > 0, let command = object["command"] as? String else { throw HelperError("Некорректный запрос") }
+                    id = requestID
+                    var result: Any?
+                    switch command {
+                    case "start":
+                        guard let config = object["config"] as? [String: Any], let killSwitch = object["killSwitch"] as? Bool, let dns = object["dnsProtection"] as? Bool else { throw HelperError("Некорректный VPN-профиль") }
+                        if let dnsServer = object["dnsServer"] as? String { try require(isIP(dnsServer), "Некорректный DNS"); session.dnsServer = dnsServer }
+                        try session.start(config, killSwitch: killSwitch, dns: dns)
+                    case "stop": try session.stop()
+                    case "protection":
+                        guard let killSwitch = object["killSwitch"] as? Bool, let dns = object["dnsProtection"] as? Bool else { throw HelperError("Некорректные параметры защиты") }
+                        try session.protection(killSwitch: killSwitch, dns: dns)
+                    case "status": break
+                    case "audit-start":
+                        _ = session.dnsAudit?.stop()
+                        try require(session.child?.isRunning == true, "Для проверки нужен активный туннель")
+                        session.dnsAudit = try DNSAudit(interface: session.outboundInterface)
+                    case "audit-stop":
+                        guard let audit = session.dnsAudit else { throw HelperError("Проверка DNS не запущена") }
+                        let packets = audit.stop(); session.dnsAudit = nil
+                        result = ["physicalDNSPackets": packets]
+                    case "audit-rules":
+                        let rules = try run("/sbin/pfctl", ["-sr"])
+                        try require(rules.0 == 0, "Не удалось прочитать правила PF")
+                        result = ["rootRulesSHA256": SHA256.hash(data: Data(rules.1.utf8)).map { String(format: "%02x", $0) }.joined()]
+                    case "abort-core":
+                        guard let child = session.child, child.isRunning else { throw HelperError("VPN-ядро не запущено") }
+                        kill(child.processIdentifier, SIGKILL)
+                        child.waitUntilExit()
+                    case "shutdown": try session.disconnect(); session.shouldExit = true
+                    default: throw HelperError("Неизвестная команда")
+                    }
+                    response = ["id": id, "result": try result ?? session.status()]
+                } catch {
+                    response = ["id": id, "error": (error as? HelperError)?.description ?? "Системная операция VPN не выполнена"]
                 }
-                response = ["id": id, "result": try session.status()]
-            } catch {
-                response = ["id": id, "error": (error as? HelperError)?.description ?? "Системная операция VPN не выполнена"]
             }
             var bytes = try JSONSerialization.data(withJSONObject: response); bytes.append(10)
             var offset = 0

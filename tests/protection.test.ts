@@ -3,6 +3,12 @@ const helper = vi.hoisted(() => ({ killSwitch: false, configure: vi.fn(), status
 vi.mock('../src/main/macos/helperClient', () => ({ macHelper: helper }));
 import { MacKillSwitch } from '../src/main/macos/protection';
 beforeEach(() => { helper.killSwitch = false; vi.clearAllMocks(); });
+it('stages protection for tunnel startup without changing the active firewall', () => {
+  const protection = new MacKillSwitch();
+  protection.prepareForTunnelStart();
+  expect(helper.killSwitch).toBe(true);
+  expect(helper.configure).not.toHaveBeenCalled();
+});
 it('installs protection before attesting an already connected tunnel', async () => {
   helper.configure.mockImplementation(async () => { helper.status.mockResolvedValue({ killSwitch: helper.killSwitch }); });
   const protection = new MacKillSwitch();

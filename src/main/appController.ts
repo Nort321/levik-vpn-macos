@@ -282,7 +282,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     this.resetTrafficStats();
     this.patch({ status: "connecting", statusDetail: `Подключение через ${server.name}…`, busy: true, downloadBytes: 0, uploadBytes: 0 });
     try {
-      if (this.state.settings.killSwitch) await this.killSwitch.enable();
+      if (this.state.settings.killSwitch) this.killSwitch.prepareForTunnelStart();
       if (this.state.settings.preventDnsLeaks) await this.dnsLeakProtection.enable();
       const config = buildXrayConfig(this.profile, server, this.state.settings);
       this.lastConfig = config;

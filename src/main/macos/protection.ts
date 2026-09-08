@@ -7,6 +7,7 @@ export class MacKillSwitch {
     macHelper.killSwitch = this.active;
     return this.active;
   }
+  prepareForTunnelStart(): void { macHelper.killSwitch = true; }
   async enable(): Promise<void> { macHelper.killSwitch = true; await macHelper.configure(); }
   async allowTunnel(): Promise<void> {
     if (!macHelper.killSwitch) return;

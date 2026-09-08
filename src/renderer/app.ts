@@ -204,6 +204,7 @@ function renderProfile(): string {
         ${state.settings.splitTunnelMode !== "off" ? `<div class="setting-row"><div><div class="setting-name">Приложения</div><div class="setting-help">${state.settings.splitTunnelProcesses.length ? `Выбрано: ${state.settings.splitTunnelProcesses.length}` : "Выберите процессы из запущенных приложений"}</div></div><button class="button compact" id="process-picker-button">${icon("process")} Выбрать</button></div>` : ""}
         ${switchSetting("Запуск с macOS", "Открывать Levik VPN после входа", "launchAtLogin", state.settings.launchAtLogin)}
         ${switchSetting("Закрытие в трей", "Кнопка закрытия скрывает приложение", "closeToTray", state.settings.closeToTray)}
+        ${switchSetting("Значок в строке меню", "Показывать значок состояния Levik VPN", "showTrayIcon", state.settings.showTrayIcon)}
         ${selectSetting("Оформление", "Единый стиль Levik VPN", "theme", state.settings.theme, [["system","Системная"],["dark","Тёмная"],["light","Светлая"],["amoled","AMOLED"]])}
         ${updateSetting()}
       </div></section>
@@ -304,7 +305,7 @@ function bindPageEvents(): void {
   document.querySelectorAll<HTMLElement>("[data-setting]").forEach((button) => button.addEventListener("click", () => {
     const currentState = state;
     if (!currentState) return;
-    const key = button.dataset.setting as "automaticServer" | "autoReconnect" | "autoConnectOnLaunch" | "killSwitch" | "useDoh" | "preventDnsLeaks" | "antiDpiEnabled" | "launchAtLogin" | "closeToTray";
+    const key = button.dataset.setting as "automaticServer" | "autoReconnect" | "autoConnectOnLaunch" | "killSwitch" | "useDoh" | "preventDnsLeaks" | "antiDpiEnabled" | "launchAtLogin" | "closeToTray" | "showTrayIcon";
     void run(() => window.levik.updateSettings({ [key]: !currentState.settings[key] }));
   }));
   document.getElementById("routing-mode")?.addEventListener("change", (event) => {

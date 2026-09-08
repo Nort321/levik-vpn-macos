@@ -50,6 +50,7 @@ export interface AppSettings {
   launchAtLogin: boolean;
   autoConnectOnLaunch: boolean;
   closeToTray: boolean;
+  showTrayIcon: boolean;
   preventDnsLeaks: boolean;
   favoriteServerIds: string[];
   antiDpiEnabled: boolean;

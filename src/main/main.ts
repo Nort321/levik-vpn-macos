@@ -25,12 +25,12 @@ app.whenReady().then(async () => {
   controller = new AppController();
   mainWindow = createWindow();
   registerIpc(controller, mainWindow);
-  createTray();
   controller.on("changed", updateTray);
   controller.on("updateInstalling", () => { quitting = true; });
   powerMonitor.on("resume", () => void controller?.restoreAfterSystemResume());
   powerMonitor.on("unlock-screen", () => void controller?.restoreAfterSystemResume());
   await controller.initialize();
+  updateTray(controller.snapshot());
   mainWindow.show();
   if (process.argv.includes('--release-checks')) void runReleaseChecks(controller);
   else if (process.argv.includes('--release-dns-checks')) void runReleaseChecks(controller, true);
@@ -87,6 +87,7 @@ function createWindow(): BrowserWindow {
 }
 
 function createTray(): void {
+  if (tray || controller?.snapshot().settings.showTrayIcon === false) return;
   const icon = trayIcon("disconnected");
   if (icon.isEmpty()) {
     console.error("Levik VPN tray icon is unavailable; continuing without tray");
@@ -99,7 +100,16 @@ function createTray(): void {
 }
 
 function updateTray(snapshot?: AppSnapshot): void {
-  if (!tray) return;
+  if (snapshot?.settings.showTrayIcon === false) {
+    tray?.destroy();
+    tray = null;
+    lastTrayKey = "";
+    return;
+  }
+  if (!tray) {
+    createTray();
+    return;
+  }
   const status = snapshot?.status ?? "disconnected";
   const server = snapshot?.servers.find((item) => item.id === snapshot.selectedServerId);
   const key = `${status}\0${server?.id ?? ""}`;

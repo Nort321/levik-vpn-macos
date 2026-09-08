@@ -270,16 +270,94 @@ func firewallRules(group: gid_t, interface: String?, killSwitch: Bool, dns: Bool
     return rules.joined(separator: "\n") + "\n"
 }
 
-func signedBundleHash() throws -> Data {
+func verifiedBundleHash(_ url: URL, expectedVersion: String? = nil) throws -> Data {
     var code: SecStaticCode?
-    try require(SecStaticCodeCreateWithPath(bundleURL as CFURL, [], &code) == errSecSuccess, "Не удалось проверить приложение")
+    try require(SecStaticCodeCreateWithPath(url as CFURL, [], &code) == errSecSuccess, "Не удалось проверить приложение")
     guard let code else { throw HelperError("Подпись приложения отсутствует") }
     try require(SecStaticCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSCheckAllArchitectures | kSecCSCheckNestedCode | kSecCSStrictValidate), nil) == errSecSuccess, "Файлы приложения изменены. Переустановите Levik VPN.")
     var info: CFDictionary?
     try require(SecCodeCopySigningInformation(code, SecCSFlags(rawValue: kSecCSSigningInformation), &info) == errSecSuccess, "Ошибка проверки подписи")
     guard let values = info as? [String: Any], values[kSecCodeInfoIdentifier as String] as? String == "com.leviknet.vpn.macos",
           let hash = values[kSecCodeInfoUnique as String] as? Data else { throw HelperError("Неизвестное приложение") }
+    if let expectedVersion {
+        let plistURL = url.appendingPathComponent("Contents/Info.plist")
+        guard let plist = NSDictionary(contentsOf: plistURL),
+              plist["CFBundleIdentifier"] as? String == "com.leviknet.vpn.macos",
+              plist["CFBundleShortVersionString"] as? String == expectedVersion else {
+            throw HelperError("Версия приложения не совпадает с обновлением")
+        }
+    }
     return hash
+}
+
+func signedBundleHash() throws -> Data { try verifiedBundleHash(bundleURL) }
+
+func validUpdateVersion(_ value: String) -> Bool {
+    value.range(of: "^[0-9]+\\.[0-9]+\\.[0-9]+$", options: .regularExpression) != nil
+}
+
+func sameProcess(_ pid: pid_t, started: UInt64) -> Bool {
+    var info = proc_bsdinfo()
+    return proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout<proc_bsdinfo>.size)) > 0 && info.pbi_start_tvsec == started
+}
+
+func launchApplication(_ application: URL, uid: uid_t) throws {
+    // launchctl selects the interactive GUI bootstrap; sudo drops the root
+    // credentials because launchctl asuser intentionally does not change UID.
+    let result = try run("/bin/launchctl", ["asuser", String(uid), "/usr/bin/sudo", "-u", "#\(uid)", "--", "/usr/bin/open", "-n", application.path], timeout: 30)
+    try require(result.0 == 0, "Не удалось перезапустить Levik VPN")
+}
+
+func installUpdate(parent: pid_t, stagedPath: String, expectedVersion: String, readyPath: String) throws {
+    try require(getuid() == 0 && parent > 1 && validUpdateVersion(expectedVersion), "Некорректный запрос обновления")
+    var parentExecutable = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+    try require(proc_pidpath(parent, &parentExecutable, UInt32(parentExecutable.count)) > 0, "Приложение не найдено")
+    let currentApplication = bundleURL.standardizedFileURL.resolvingSymlinksInPath()
+    let expectedExecutable = currentApplication.appendingPathComponent("Contents/MacOS/Levik VPN").path
+    try require(String(cString: parentExecutable) == expectedExecutable && currentApplication.path.hasPrefix("/Applications/"), "Запустите установленное приложение")
+    var parentInfo = proc_bsdinfo()
+    try require(proc_pidinfo(parent, PROC_PIDTBSDINFO, 0, &parentInfo, Int32(MemoryLayout<proc_bsdinfo>.size)) > 0 && parentInfo.pbi_uid != 0, "Некорректный владелец приложения")
+    let uid = parentInfo.pbi_uid
+    let parentStarted = parentInfo.pbi_start_tvsec
+    guard let account = getpwuid(uid), let homePointer = account.pointee.pw_dir else { throw HelperError("Пользователь приложения не найден") }
+    let allowedRoot = URL(fileURLWithPath: String(cString: homePointer)).appendingPathComponent("Library/Application Support/levik-vpn-macos/update-staging", isDirectory: true).standardizedFileURL.resolvingSymlinksInPath()
+    let stagedApplication = URL(fileURLWithPath: stagedPath).standardizedFileURL.resolvingSymlinksInPath()
+    let marker = URL(fileURLWithPath: readyPath).standardizedFileURL
+    try require(stagedApplication.path.hasPrefix(allowedRoot.path + "/") && marker == stagedApplication.deletingLastPathComponent().appendingPathComponent(".installer-ready"), "Некорректный путь обновления")
+    var stagedInfo = stat()
+    try require(lstat(stagedApplication.path, &stagedInfo) == 0 && (stagedInfo.st_mode & S_IFMT) == S_IFDIR && stagedInfo.st_uid == uid, "Небезопасный каталог обновления")
+    _ = try verifiedBundleHash(stagedApplication, expectedVersion: expectedVersion)
+    let candidate = currentApplication.deletingLastPathComponent().appendingPathComponent(".Levik-VPN-update-\(UUID().uuidString).app")
+    var swapped = false
+    do {
+        // Copy into the root-owned Applications directory before signalling
+        // readiness. The user-writable staging tree is never trusted again.
+        try FileManager.default.copyItem(at: stagedApplication, to: candidate)
+        _ = try verifiedBundleHash(candidate, expectedVersion: expectedVersion)
+        try Data("ready\n".utf8).write(to: marker, options: .atomic)
+        chmod(marker.path, 0o644)
+        let exitDeadline = Date().addingTimeInterval(120)
+        while sameProcess(parent, started: parentStarted) && Date() < exitDeadline { Thread.sleep(forTimeInterval: 0.1) }
+        try require(!sameProcess(parent, started: parentStarted), "Приложение не завершилось для установки")
+        let result = candidate.path.withCString { source in
+            currentApplication.path.withCString { destination in renamex_np(source, destination, UInt32(RENAME_SWAP)) }
+        }
+        try require(result == 0, "Не удалось атомарно заменить приложение")
+        swapped = true
+        _ = try verifiedBundleHash(currentApplication, expectedVersion: expectedVersion)
+        try launchApplication(currentApplication, uid: uid)
+        try? FileManager.default.removeItem(at: candidate)
+        try? FileManager.default.removeItem(at: stagedApplication.deletingLastPathComponent())
+    } catch {
+        if swapped {
+            _ = candidate.path.withCString { source in
+                currentApplication.path.withCString { destination in renamex_np(source, destination, UInt32(RENAME_SWAP)) }
+            }
+        }
+        try? FileManager.default.removeItem(at: candidate)
+        if !sameProcess(parent, started: parentStarted) { try? launchApplication(currentApplication, uid: uid) }
+        throw error
+    }
 }
 
 func tunnelGroup() throws -> gid_t {
@@ -703,6 +781,7 @@ func selfTest() throws {
     try require(isIP("1.1.1.1") && isIP("::1") && !isIP("999.1.1.1"), "Address validation failed")
     try require(coreErrorCategory("[Warning] failed to dial: connection refused at private.example with credential") == "VPN-сервер отклонил соединение", "Diagnostic classification failed")
     try require(coreErrorCategory("private profile payload") == nil, "Diagnostic privacy regression")
+    try require(validUpdateVersion("1.2.3") && !validUpdateVersion("1.2") && !validUpdateVersion("1.2.3-beta"), "Update version validation failed")
     print("Native helper self-tests passed")
 }
 
@@ -719,6 +798,9 @@ do {
     }
     else if CommandLine.arguments.count == 2 && CommandLine.arguments[1] == "--verify-bundle" { _ = try signedBundleHash(); print("Application bundle verified") }
     else if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--serve", let parent = Int32(CommandLine.arguments[2]) { try serve(parent: parent) }
+    else if CommandLine.arguments.count == 6 && CommandLine.arguments[1] == "--install-update", let parent = Int32(CommandLine.arguments[2]) {
+        try installUpdate(parent: parent, stagedPath: CommandLine.arguments[3], expectedVersion: CommandLine.arguments[4], readyPath: CommandLine.arguments[5])
+    }
     else { throw HelperError("Unsupported invocation") }
 } catch {
     let message = (error as? HelperError)?.description ?? "Native VPN operation failed"

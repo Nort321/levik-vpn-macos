@@ -42,6 +42,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   launchAtLogin: false,
   autoConnectOnLaunch: false,
   closeToTray: true,
+  showTrayIcon: true,
   preventDnsLeaks: true,
   favoriteServerIds: [],
   antiDpiEnabled: false,
@@ -52,7 +53,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   splitTunnelProcesses: [],
 };
 
-const SETTINGS_SCHEMA_VERSION = 2;
+const SETTINGS_SCHEMA_VERSION = 3;
 
 type PersistedSettings = Partial<AppSettings> & {
   settingsSchemaVersion?: number;
@@ -767,6 +768,7 @@ function validateSettings(value: AppSettings): AppSettings {
     launchAtLogin: Boolean(value.launchAtLogin),
     autoConnectOnLaunch: Boolean(value.autoConnectOnLaunch),
     closeToTray: Boolean(value.closeToTray),
+    showTrayIcon: Boolean(value.showTrayIcon),
     preventDnsLeaks: Boolean(value.preventDnsLeaks),
     favoriteServerIds: [...new Set(value.favoriteServerIds.filter((id) => /^[a-f0-9]{64}$/.test(id)))].slice(0, 200),
     antiDpiEnabled: Boolean(value.antiDpiEnabled),

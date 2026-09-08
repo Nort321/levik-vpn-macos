@@ -16,6 +16,7 @@ const settings: AppSettings = {
   launchAtLogin: false,
   autoConnectOnLaunch: false,
   closeToTray: true,
+  showTrayIcon: true,
   preventDnsLeaks: true,
   favoriteServerIds: [],
   antiDpiEnabled: false,

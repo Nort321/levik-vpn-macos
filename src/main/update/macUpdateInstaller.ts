@@ -84,7 +84,9 @@ export async function launchMacUpdateInstaller(update: PreparedMacUpdate): Promi
   const argumentsList = [helper, "--install-update", String(process.pid), update.bundlePath, update.version, readyPath]
     .map(quoteShellArgument)
     .join(" ");
-  const command = `/usr/bin/nohup ${argumentsList} >${quoteShellArgument(outputPath)} 2>&1 </dev/null &`;
+  // macOS nohup tries to detach from a console that the privileged AppleScript
+  // session does not have. Inherit ignored SIGHUP across exec instead.
+  const command = `(trap '' HUP; exec ${argumentsList}) >${quoteShellArgument(outputPath)} 2>&1 </dev/null &`;
   try {
     await execute("/usr/bin/osascript", ["-e", ADMIN_LAUNCH_SCRIPT, command], { timeout: 180_000, maxBuffer: 1024 * 1024 });
   } catch {

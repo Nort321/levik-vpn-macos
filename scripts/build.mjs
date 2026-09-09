@@ -42,6 +42,9 @@ await Promise.all([
   cp("src/renderer/index.html", "dist/renderer/index.html"),
   cp("src/renderer/styles.css", "dist/renderer/styles.css"),
   cp("build/icon.png", "dist/assets/icon.png"),
+  cp("build/logo.png", "dist/assets/logo.png"),
   cp("build/tray-connected.png", "dist/assets/tray-connected.png"),
   cp("build/tray-disconnected.png", "dist/assets/tray-disconnected.png"),
+  cp("build/tray-connected@2x.png", "dist/assets/tray-connected@2x.png"),
+  cp("build/tray-disconnected@2x.png", "dist/assets/tray-disconnected@2x.png"),
 ]);

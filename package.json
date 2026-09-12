@@ -16,6 +16,7 @@
     "package:local": "npm run build && electron-builder --mac dmg zip --publish never --config.mac.identity=- --config.mac.entitlements=build/entitlements.local.plist --config.mac.entitlementsInherit=build/entitlements.local.plist"
   },
   "devDependencies": {
+    "@types/qrcode": "^1.5.5",
     "electron": "44.0.0",
     "electron-builder": "26.15.3",
     "esbuild": "0.25.10",
@@ -72,7 +73,7 @@
       "entitlements": "build/entitlements.mac.plist",
       "entitlementsInherit": "build/entitlements.mac.plist",
       "extendInfo": {
-        "NSHumanReadableCopyright": "Copyright \u00a9 Levik VPN. AGPL-3.0-only."
+        "NSHumanReadableCopyright": "Copyright © Levik VPN. AGPL-3.0-only."
       },
       "notarize": false,
       "binaries": [
@@ -108,6 +109,7 @@
     ]
   },
   "dependencies": {
-    "electron-updater": "^6.8.9"
+    "electron-updater": "^6.8.9",
+    "qrcode": "^1.5.4"
   }
 }

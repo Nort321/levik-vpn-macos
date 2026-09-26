@@ -104,6 +104,7 @@ describe("macOS tunnel profile", () => {
     const config = buildXrayConfig(prepared, prepared.servers[0]!, settings);
     const inbounds = config.inbounds as Array<Record<string, unknown>>;
     expect(inbounds[0]?.protocol).toBe("tun");
+    expect(inbounds[0]?.sniffing).toEqual({ enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true });
     expect(inbounds[0]?.settings).toEqual(expect.objectContaining({
       autoSystemRoutingTable: ["0.0.0.0/0", "::/0"],
       autoOutboundsInterface: "auto",
@@ -169,6 +170,7 @@ describe("macOS tunnel profile", () => {
     const config = buildLockdownConfig(settings);
     const routing = config.routing as { rules: Array<{ outboundTag: string }> };
     expect(routing.rules.at(-1)?.outboundTag).toBe("levik-block");
+    expect(config).toHaveProperty("inbounds.0.sniffing.routeOnly", true);
   });
 
   it("uses the expanded blocked-only domain set", () => {
@@ -182,6 +184,96 @@ describe("macOS tunnel profile", () => {
     const config = buildXrayConfig(profile, profile.servers[0]!, { ...settings, routingMode: "blockedOnly" });
     const routing = config.routing as { rules: Array<{ domain?: string[]; outboundTag: string }> };
     const proxyRule = routing.rules.find((rule) => rule.outboundTag === profile.servers[0]?.tag && rule.domain);
-    expect(proxyRule?.domain?.length).toBeGreaterThan(30);
+    expect(proxyRule?.domain).toEqual(expect.arrayContaining([
+      "domain:discord.com", "domain:discordapp.com", "domain:discord.gg",
+      "domain:discord.media", "domain:discordapp.net", "domain:discordcdn.com", "geosite:discord",
+    ]));
+    expect(routing.rules.indexOf(proxyRule!)).toBeLessThan(routing.rules.length - 1);
+    expect(routing.rules.at(-1)).toEqual({ type: "field", network: "tcp,udp", outboundTag: "levik-direct" });
+  });
+});
+
+
+describe("alternate XHTTP Mux", () => {
+  const alternateHost = "leva.levikfartik.ru";
+  const uuid = "11111111-1111-4111-8111-111111111111";
+  const link = (host: string, network: string) =>
+    `vless://${uuid}@${host}:443?security=tls&type=${network}&path=%2Fapi%2FgetFile%2F&mode=packet-up#Alternate`;
+  const prepare = (content: string) => prepareTunnelProfile(Buffer.from(JSON.stringify({
+    version: 1, profileId: "alternate-xhttp", subscriptionId: "subscription-1",
+    source: { mediaType: "text/plain", content },
+  })), "subscription-1");
+
+  it.each(["xhttp", "splithttp"])("enables Mux for an alternate %s share link without mutating the profile", (network) => {
+    const profile = prepare(link(alternateHost, network));
+    const original = structuredClone(profile);
+    const server = profile.servers[0]!;
+    for (const antiDpiEnabled of [false, true]) {
+      const config = buildXrayConfig(profile, server, { ...settings, antiDpiEnabled });
+      expect(config).toHaveProperty("outbounds.0.mux", { enabled: true, concurrency: 1 });
+      expect(config).toHaveProperty("outbounds.0.streamSettings.xhttpSettings.path", "/api/getFile/");
+      expect(config).toHaveProperty("outbounds.0.streamSettings.tlsSettings.serverName", alternateHost);
+      if (antiDpiEnabled) {
+        expect(config).toHaveProperty("outbounds.0.streamSettings.sockopt.dialerProxy", "levik-fragment");
+        expect(config.outbounds).toContainEqual(expect.objectContaining({ tag: "levik-fragment" }));
+      } else {
+        expect(config.outbounds).not.toContainEqual(expect.objectContaining({ tag: "levik-fragment" }));
+      }
+      const assets = resolve("vendor", "xray", `darwin-${process.arch}`);
+      expect(() => execFileSync(resolve("build", "native", process.arch, "levik-helper"), ["--validate-config"], {
+        input: JSON.stringify(config), timeout: 10_000, stdio: ["pipe", "pipe", "pipe"],
+      })).not.toThrow();
+      expect(() => execFileSync(resolve(assets, "xray"), ["run", "-test", "-format", "json", "-config", "stdin:"], {
+        input: JSON.stringify(config), timeout: 10_000, stdio: ["pipe", "pipe", "pipe"],
+        env: { ...process.env, XRAY_LOCATION_ASSET: assets },
+      })).not.toThrow();
+    }
+    expect(profile).toEqual(original);
+  });
+
+  it.each([
+    { enabled: false },
+    { enabled: true, concurrency: 8, xudpConcurrency: 16, xudpProxyUDP443: "allow" },
+    {},
+    null,
+  ])("preserves explicit JSON profile Mux settings: %j", (mux) => {
+    const outbound = prepare(link(alternateHost, "xhttp")).servers[0]!.outbound;
+    const profile = prepare(JSON.stringify({ outbounds: [{ ...outbound, mux }] }));
+    for (const antiDpiEnabled of [false, true]) {
+      const config = buildXrayConfig(profile, profile.servers[0]!, { ...settings, antiDpiEnabled });
+      expect(config).toHaveProperty("outbounds.0.mux", mux);
+    }
+  });
+
+  it("matches JSON endpoint host and transport case insensitively", () => {
+    const profile = prepare(JSON.stringify({ outbounds: [{
+      protocol: "vless", settings: { vnext: [{ address: "LEVA.LEVIKFARTIK.RU" }] },
+      streamSettings: { network: "SplitHTTP" },
+    }] }));
+    expect(buildXrayConfig(profile, profile.servers[0]!, settings))
+      .toHaveProperty("outbounds.0.mux", { enabled: true, concurrency: 1 });
+  });
+
+  it.each([
+    ["example.com", "xhttp"],
+    ["example.com", "splithttp"],
+    ["leva.levikfartik.ru.example.com", "xhttp"],
+    [alternateHost, "tcp"],
+    [alternateHost, "ws"],
+  ])("leaves %s over %s unchanged", (host, network) => {
+    const profile = prepare(link(host, network));
+    expect(buildXrayConfig(profile, profile.servers[0]!, settings)).not.toHaveProperty("outbounds.0.mux");
+  });
+
+  it.each([
+    { protocol: "trojan", settings: { servers: [{ address: alternateHost }] } },
+    { protocol: "vless", settings: { vnext: [{ address: alternateHost }, { address: "example.com" }] } },
+    { protocol: "vless", settings: { vnext: [] } },
+    { protocol: "vless", settings: { vnext: [null] } },
+    { protocol: "vless", settings: { vnext: [{ address: 42 }] } },
+    { protocol: "vless", settings: {} },
+  ])("does not enable Mux for unrelated or incomplete JSON outbounds: %j", (outbound) => {
+    const profile = prepare(JSON.stringify({ outbounds: [{ ...outbound, streamSettings: { network: "xhttp" } }] }));
+    expect(buildXrayConfig(profile, profile.servers[0]!, settings)).not.toHaveProperty("outbounds.0.mux");
   });
 });

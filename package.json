@@ -1,6 +1,6 @@
 {
   "name": "levik-vpn-macos",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "description": "Official Levik VPN client for macOS",
   "main": "dist/main/main.js",

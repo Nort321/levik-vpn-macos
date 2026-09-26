@@ -20,7 +20,8 @@ const BLOCKED_DOMAINS = [
   "domain:x.com", "domain:twitter.com", "domain:twimg.com", "domain:openai.com", "domain:chatgpt.com",
   "domain:oaistatic.com", "domain:oaiusercontent.com", "domain:claude.ai", "domain:anthropic.com",
   "domain:notion.so", "domain:notion.site", "domain:discord.com", "domain:discordapp.com",
-  "domain:discord.gg", "domain:canva.com", "domain:linkedin.com", "domain:licdn.com",
+  "domain:discord.gg", "domain:discord.media", "domain:discordapp.net", "domain:discordcdn.com",
+  "geosite:discord", "domain:canva.com", "domain:linkedin.com", "domain:licdn.com",
   "domain:spotify.com", "domain:rutracker.org", "domain:flibusta.is", "domain:meduza.io",
   "domain:bbc.com", "domain:dw.com", "domain:svoboda.org", "domain:rferl.org",
   "domain:zona.media", "domain:theins.ru", "domain:novayagazeta.eu", "domain:holod.media",
@@ -31,7 +32,8 @@ export function buildXrayConfig(
   server: TunnelServer,
   settings: AppSettings,
 ): Record<string, unknown> {
-  const selectedOutbound = withAntiDpi(server, settings);
+  const antiDpiOutbound = withAntiDpi(server, settings);
+  const selectedOutbound = withAlternateXhttpMux(antiDpiOutbound);
   const directDomains = [...profile.directDomains];
   const proxyDomains = [...profile.proxyDomains];
   if (settings.routingMode === "blockedOnly") proxyDomains.push(...BLOCKED_DOMAINS);
@@ -73,7 +75,7 @@ export function buildXrayConfig(
       selectedOutbound,
       { tag: "levik-dns-out", protocol: "dns", settings: { nonIPQuery: "drop" } },
       { tag: "levik-direct", protocol: "freedom", settings: { domainStrategy: "UseIP" } },
-      ...(settings.antiDpiEnabled && selectedOutbound !== server.outbound ? [{
+      ...(settings.antiDpiEnabled && antiDpiOutbound !== server.outbound ? [{
         tag: "levik-fragment",
         protocol: "freedom",
         settings: {
@@ -91,6 +93,22 @@ export function buildXrayConfig(
     policy: { system: { statsInboundDownlink: true, statsInboundUplink: true, statsOutboundDownlink: true, statsOutboundUplink: true } },
     stats: {},
   };
+}
+
+function withAlternateXhttpMux(outbound: Record<string, unknown>): Record<string, unknown> {
+  if ("mux" in outbound || outbound.protocol !== "vless") return outbound;
+  const stream = outbound.streamSettings;
+  if (!isRecord(stream) || typeof stream.network !== "string") return outbound;
+  if (!["xhttp", "splithttp"].includes(stream.network.toLowerCase())) return outbound;
+  const settings = outbound.settings;
+  if (!isRecord(settings) || !Array.isArray(settings.vnext) || settings.vnext.length === 0) return outbound;
+  if (!settings.vnext.every((server: unknown) => isRecord(server)
+    && typeof server.address === "string"
+    && server.address.toLowerCase() === "leva.levikfartik.ru")) return outbound;
+
+  // This edge requires the patched server's Mux keepalive for idle XHTTP downlinks.
+  // Explicit profile settings take precedence; other hosts keep their own behavior.
+  return { ...outbound, mux: { enabled: true, concurrency: 1 } };
 }
 
 function withAntiDpi(server: TunnelServer, settings: AppSettings): Record<string, unknown> {
@@ -141,7 +159,7 @@ function tunInbound(dnsServer: string): Record<string, unknown> {
       autoSystemRoutingTable: FULL_TUN_ROUTES,
       autoOutboundsInterface: "auto",
     },
-    sniffing: { enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: false },
+    sniffing: { enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true },
   };
 }
 

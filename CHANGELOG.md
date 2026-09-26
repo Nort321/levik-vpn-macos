@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.1
+
+- Enable Mux for the alternate VLESS XHTTP/SplitHTTP host to use server keepalives, preserving explicit profile settings and Anti-DPI behavior.
+- Route Discord media and CDN domains through the VPN in blocked-only mode, including the bundled Discord geosite list.
+- Keep sniffing limited to routing in generated configurations, matching the native helper and preserving destination IPs.
+- Add regression tests and validate alternate XHTTP configurations with the native helper and bundled Xray core.
+
 ## 1.0.0
 
 - First macOS client with the Windows visual style in a portrait window.

@@ -3,6 +3,7 @@ import { macHelper } from "../macos/helperClient";
 import { join } from "node:path";
 import { EventEmitter } from "node:events";
 import { XrayStatsClient } from "./xrayStats";
+import { isTunnelHealthy } from "./tunnelHealth";
 
 interface XrayEvents {
   log: [line: string];
@@ -18,6 +19,9 @@ export class XrayManager extends EventEmitter<XrayEvents> {
   private statsErrorReported = false;
   private statsGeneration = 0;
   private readonly statsClient = new XrayStatsClient();
+  private healthTimer: ReturnType<typeof setInterval> | null = null;
+  private healthCheckRunning = false;
+  private healthFailures = 0;
 
   async start(config: Record<string, unknown>): Promise<void> {
     this.stopping = true;
@@ -47,9 +51,11 @@ export class XrayManager extends EventEmitter<XrayEvents> {
 
   async isHealthy(): Promise<boolean> {
     if (!this.running) return false;
+    const generation = this.statsGeneration;
     try {
       await this.statsClient.query("inbound>>>levik-tun-in>>>");
-      return this.running;
+      const healthy = await isTunnelHealthy();
+      return healthy && this.running && generation === this.statsGeneration;
     } catch {
       return false;
     }
@@ -64,16 +70,38 @@ export class XrayManager extends EventEmitter<XrayEvents> {
   private startStatsPolling(): void {
     this.stopStatsPolling();
     this.statsErrorReported = false;
+    this.healthFailures = 0;
     void this.queryStats();
     this.statsTimer = setInterval(() => void this.queryStats(), 2_000);
+    this.healthTimer = setInterval(() => void this.checkTrafficHealth(), 30_000);
   }
 
   private stopStatsPolling(): void {
     if (this.statsTimer) clearInterval(this.statsTimer);
     this.statsTimer = null;
+    if (this.healthTimer) clearInterval(this.healthTimer);
+    this.healthTimer = null;
     this.statsGeneration += 1;
     this.statsQueryRunning = false;
     this.statsClient.close();
+  }
+
+  private async checkTrafficHealth(): Promise<void> {
+    if (!this.running || this.healthCheckRunning) return;
+    const generation = this.statsGeneration;
+    this.healthCheckRunning = true;
+    try {
+      const healthy = await this.isHealthy();
+      if (generation !== this.statsGeneration || !this.running) return;
+      this.healthFailures = healthy ? 0 : this.healthFailures + 1;
+      if (this.healthFailures < 3) return;
+      this.emit("log", "VPN перестал передавать трафик. Восстановление соединения…");
+      this.running = false;
+      this.stopStatsPolling();
+      this.emit("exit", null, false);
+    } finally {
+      this.healthCheckRunning = false;
+    }
   }
 
   private async queryStats(): Promise<void> {

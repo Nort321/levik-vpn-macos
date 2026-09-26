@@ -16,7 +16,7 @@ import { RequestSigner } from "./security/requestSigner";
 import { SecureStore } from "./security/secureStore";
 import { decryptTunnelProfile, prepareTunnelProfile } from "./vpn/tunnelProfile";
 import type { PreparedTunnelProfile } from "./vpn/tunnelProfile";
-import { buildLockdownConfig, buildXrayConfig } from "./vpn/xrayConfig";
+import { buildXrayConfig } from "./vpn/xrayConfig";
 import { XrayManager } from "./vpn/xrayManager";
 import { measureServerLatencies } from "./vpn/serverPinger";
 import { DnsLeakProtection } from "./macos/protection";
@@ -581,16 +581,9 @@ export class AppController extends EventEmitter<AppControllerEvents> {
       return;
     }
     const delayMs = Math.min(30_000, 1_000 * 2 ** Math.min(this.reconnectAttempts++, 5));
-    if (this.state.settings.killSwitch && !this.lockdownActive) {
-      void this.startXray(buildLockdownConfig(this.state.settings)).then(() => {
-        this.lockdownActive = true;
-        this.addLog("Kill Switch: аварийная блокировка трафика активна");
-      }).catch((error: unknown) => {
-        this.addLog(`Kill Switch: ${messageOf(error)}`);
-      }).finally(() => this.scheduleTunnelRestore(delayMs));
-    } else {
-      this.scheduleTunnelRestore(delayMs);
-    }
+    // The native helper retains PF protection across core replacement. A
+    // second blackhole core is neither needed nor accepted by the helper.
+    this.scheduleTunnelRestore(delayMs);
   }
 
   private scheduleTunnelRestore(delayMs: number): void {

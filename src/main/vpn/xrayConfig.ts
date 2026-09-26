@@ -66,14 +66,16 @@ export function buildXrayConfig(
     dns: {
       tag: "levik-dns",
       servers: settings.useDoh
-        ? [{ address: "https://1.1.1.1/dns-query", skipFallback: false }, settings.dnsServer]
+        ? ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"]
         : [settings.dnsServer],
       queryStrategy: "UseIP",
     },
     inbounds: [tunInbound(settings.dnsServer)],
     outbounds: [
       selectedOutbound,
-      { tag: "levik-dns-out", protocol: "dns", settings: { nonIPQuery: "drop" } },
+      // Answer unsupported records immediately; dropping HTTPS/SVCB queries
+      // makes browsers wait for DNS timeouts before opening a connection.
+      { tag: "levik-dns-out", protocol: "dns", settings: {} },
       { tag: "levik-direct", protocol: "freedom", settings: { domainStrategy: "UseIP" } },
       ...(settings.antiDpiEnabled && antiDpiOutbound !== server.outbound ? [{
         tag: "levik-fragment",

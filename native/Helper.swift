@@ -29,7 +29,7 @@ func run(_ path: String, _ arguments: [String], input: Data? = nil, timeout: Dou
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = arguments
-        process.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "en_US.UTF-8", "XRAY_LOCATION_ASSET": coreURL.deletingLastPathComponent().path, "GOMEMLIMIT": "64MiB"]
+        process.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "en_US.UTF-8", "XRAY_LOCATION_ASSET": coreURL.deletingLastPathComponent().path]
         let output = Pipe()
         let incoming = Pipe()
         process.standardOutput = output
@@ -435,7 +435,7 @@ final class TunnelSession {
         config["api"] = ["tag": "levik-api", "listen": "127.0.0.1:47185", "services": ["StatsService"]]
         config["inbounds"] = [["tag": "levik-tun-in", "protocol": "tun", "settings": ["name": interface!, "mtu": 1500, "gateway": ["10.89.0.1/30"], "autoSystemRoutingTable": ["0.0.0.0/0", "::/0"], "autoOutboundsInterface": outboundInterface], "sniffing": ["enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true]]]
         var inbounds = config["inbounds"] as! [[String: Any]]
-        inbounds.append(["tag": "levik-connectivity", "listen": "127.0.0.1", "port": 47186, "protocol": "socks", "settings": ["auth": "noauth", "udp": false]])
+        inbounds.append(["tag": "levik-connectivity", "listen": "127.0.0.1", "port": 47186, "protocol": "http", "settings": ["allowTransparent": false]])
         config["inbounds"] = inbounds
         var dnsConfig = config["dns"] as? [String: Any] ?? [:]
         var hosts = dnsConfig["hosts"] as? [String: Any] ?? [:]
@@ -470,7 +470,7 @@ final class TunnelSession {
         let process = Process()
         process.executableURL = coreURL
         process.arguments = ["run", "-format", "json", "-config", "stdin:"]
-        process.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "en_US.UTF-8", "XRAY_LOCATION_ASSET": coreURL.deletingLastPathComponent().path, "GOMEMLIMIT": "64MiB"]
+        process.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "en_US.UTF-8", "XRAY_LOCATION_ASSET": coreURL.deletingLastPathComponent().path]
         let input = Pipe()
         let output = Pipe()
         diagnostics = CoreDiagnostics()
@@ -502,13 +502,14 @@ final class TunnelSession {
     }
 
     func verifyConnectivity() throws {
-        // SOCKS routes this HTTPS request through the selected outbound even
-        // with per-app bypass rules or another VPN present on the host.
-        let result = try run("/usr/bin/curl", ["--proxy", "socks5://127.0.0.1:47186", "--noproxy", "", "--connect-timeout", "5", "--max-time", "8", "--silent", "--output", "/dev/null", "--write-out", "%{http_code}", "https://1.1.1.1/cdn-cgi/trace"], timeout: 10)
-        guard result.0 == 0 && result.1 == "200" else {
-            let detail = diagnostics.summary()
-            throw HelperError("VPN-сервер не передаёт данные" + (detail.isEmpty ? " (HTTPS: \(result.0)). Выберите другой сервер." : ": \(detail).") + " Выход: \(outboundInterface).")
+        // Check independent destinations through the selected VPN. A single
+        // blocked probe service must not reject a working server.
+        for url in ["https://www.cloudflare.com/cdn-cgi/trace", "https://www.google.com/generate_204"] {
+            if let result = try? run("/usr/bin/curl", ["--proxy", "http://127.0.0.1:47186", "--noproxy", "", "--connect-timeout", "5", "--max-time", "8", "--silent", "--output", "/dev/null", "--write-out", "%{http_code}", url], timeout: 10),
+               result.0 == 0 && ["200", "204"].contains(result.1) { return }
         }
+        let detail = diagnostics.summary()
+        throw HelperError("VPN-сервер не передаёт данные" + (detail.isEmpty ? ". Выберите другой сервер." : ": \(detail)."))
     }
 
     func stop() throws {
@@ -635,14 +636,16 @@ func resolveEndpoint(_ host: String) throws -> [String] {
     // Use an IP-literal HTTPS bootstrap so reconnect does not depend on a DNS
     // resolver behind the stopped tunnel. curl keeps CFNetwork and its caches
     // out of this long-lived privileged process.
-    let response = try run("/usr/bin/curl", ["--connect-timeout", "5", "--max-time", "8", "--silent", "--show-error", "--fail", "--header", "Accept: application/dns-json", "https://1.1.1.1/dns-query?name=\(host)&type=A"], timeout: 10)
-    guard response.0 == 0,
-          let object = try? JSONSerialization.jsonObject(with: Data(response.1.utf8)) as? [String: Any],
-          object["Status"] as? Int == 0,
-          let answers = object["Answer"] as? [[String: Any]] else { throw HelperError("Не удалось определить адрес VPN-сервера") }
-    let result = answers.compactMap { $0["data"] as? String }.filter(isIP)
-    try require(!result.isEmpty, "Не удалось определить адрес VPN-сервера")
-    return result
+    for resolver in ["https://1.1.1.1/dns-query", "https://8.8.8.8/resolve"] {
+        guard let response = try? run("/usr/bin/curl", ["--noproxy", "*", "--connect-timeout", "3", "--max-time", "5", "--silent", "--fail", "--header", "Accept: application/dns-json", "\(resolver)?name=\(host)&type=A"], timeout: 7),
+              response.0 == 0,
+              let object = try? JSONSerialization.jsonObject(with: Data(response.1.utf8)) as? [String: Any],
+              object["Status"] as? Int == 0,
+              let answers = object["Answer"] as? [[String: Any]] else { continue }
+        let result = answers.filter { $0["type"] as? Int == 1 }.compactMap { $0["data"] as? String }.filter(isIP)
+        if !result.isEmpty { return result }
+    }
+    throw HelperError("Не удалось определить адрес VPN-сервера")
 }
 
 func serve(parent: pid_t) throws {

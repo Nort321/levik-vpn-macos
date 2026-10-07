@@ -115,7 +115,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
   async initialize(): Promise<void> {
     this.identity = await this.loadIdentity();
     this.api = new MobileApiClient(
-      process.env.LEVIK_API_ORIGIN ?? "https://leviknet.com",
+      process.env.LEVIK_API_ORIGIN ?? "https://api.leviknet.org",
       new RequestSigner(this.identity),
       app.getVersion(),
     );

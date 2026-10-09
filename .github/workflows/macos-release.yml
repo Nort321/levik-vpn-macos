@@ -118,10 +118,13 @@ jobs:
         run: |
           set -euo pipefail
           tag="v$VERSION"
+          notes="$RUNNER_TEMP/release-notes.md"
+          awk '/^## / {section++; next} section == 1 {print}' CHANGELOG.md > "$notes"
+          test -s "$notes"
           if gh release view "$tag" >/dev/null 2>&1; then
             test "$(gh release view "$tag" --json isDraft --jq .isDraft)" = true || { echo 'Refusing to overwrite a published release'; exit 1; }
             gh release upload "$tag" release/* --clobber
-            gh release edit "$tag" --draft=false
+            gh release edit "$tag" --notes-file "$notes" --draft=false
           else
-            gh release create "$tag" release/* --target "$COMMIT_SHA" --title "Levik VPN для macOS $VERSION" --generate-notes
+            gh release create "$tag" release/* --target "$COMMIT_SHA" --title "Levik VPN для macOS $VERSION" --notes-file "$notes"
           fi

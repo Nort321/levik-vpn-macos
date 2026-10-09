@@ -2,10 +2,9 @@
 
 ## 1.1.0
 
-- Add TUIC v5 servers through a bundled sing-box 1.14.2 sidecar, started by the native helper inside the PF-isolated VPN group.
-- Pin the TUIC trust anchor from the Levik profile and accept only IP-literal TUIC servers; unpinned or malformed links are skipped.
-- Group protocol variants of one server into a single card with a VLESS / Hysteria 2 / TUIC switch; unavailable protocols are not shown.
-- Keep automatic server selection on Xray protocols; stop the tunnel when the TUIC sidecar exits so recovery reconnects.
+- Добавили дополнительный способ подключения к серверам.
+- Теперь способ подключения можно выбрать прямо в карточке сервера.
+- Улучшили работу с обновлёнными настройками серверов в сетях с ограничениями.
 
 ## 1.0.1
 

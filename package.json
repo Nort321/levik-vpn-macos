@@ -1,6 +1,6 @@
 {
   "name": "levik-vpn-macos",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "private": true,
   "description": "Official Levik VPN client for macOS",
   "main": "dist/main/main.js",
@@ -11,6 +11,7 @@
     "build": "node scripts/build.mjs && node scripts/build-native.mjs",
     "test": "vitest run",
     "download:xray": "node scripts/download-xray.mjs",
+    "download:singbox": "node scripts/download-singbox.mjs",
     "package:mac": "npm run build && electron-builder --mac dmg zip --publish never",
     "check": "npm run lint && npm run build && npm test",
     "package:local": "npm run build && electron-builder --mac dmg zip --publish never --config.mac.identity=- --config.mac.entitlements=build/entitlements.local.plist --config.mac.entitlementsInherit=build/entitlements.local.plist"
@@ -48,6 +49,15 @@
         ]
       },
       {
+        "from": "vendor/singbox/darwin-${arch}",
+        "to": "singbox",
+        "filter": [
+          "sing-box",
+          "LICENSE",
+          "VERSION"
+        ]
+      },
+      {
         "from": "build/native/${arch}",
         "to": "native",
         "filter": [
@@ -78,7 +88,8 @@
       "notarize": false,
       "binaries": [
         "Contents/Resources/native/levik-helper",
-        "Contents/Resources/xray/xray"
+        "Contents/Resources/xray/xray",
+        "Contents/Resources/singbox/sing-box"
       ]
     },
     "dmg": {

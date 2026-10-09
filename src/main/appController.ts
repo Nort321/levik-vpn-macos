@@ -7,6 +7,7 @@ import type {
   AppSnapshot,
   LoginChallenge,
   TunnelServer,
+  TuicEndpoint,
 } from "../shared/contracts";
 import { isAuthenticationRejected, MobileApiClient } from "./api/mobileApiClient";
 import type { AuthChallengeResponse, MobileAccountResponse } from "./api/models";
@@ -72,6 +73,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
   private loginGeneration = 0;
   private reconnectAttempts = 0;
   private lastConfig: Record<string, unknown> | null = null;
+  private lastTuic: TuicEndpoint | undefined;
   private lockdownActive = false;
   private trafficDownloadOffset = 0;
   private trafficUploadOffset = 0;
@@ -289,6 +291,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
       if (this.state.settings.preventDnsLeaks) await this.dnsLeakProtection.enable();
       const config = buildXrayConfig(this.profile, server, this.state.settings);
       this.lastConfig = config;
+      this.lastTuic = server.tuic;
       await this.startXray(config);
       this.lockdownActive = false;
       this.reconnectAttempts = 0;
@@ -326,6 +329,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     }
     this.lockdownActive = false;
     this.lastConfig = null;
+    this.lastTuic = undefined;
     this.patch({ status: "disconnected", statusDetail: null, sessionStartedAt: null });
   }
 
@@ -557,6 +561,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     this.accessToken = null;
     this.profile = null;
     this.lastConfig = null;
+    this.lastTuic = undefined;
     await Promise.all([
       this.secureStore.remove("access_token"),
       this.secureStore.remove("tunnel_profile"),
@@ -613,7 +618,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
   }
 
   private async startXray(config: Record<string, unknown>): Promise<void> {
-    await this.xray.start(config);
+    await this.xray.start(config, this.lastTuic);
     try {
       await this.killSwitch.allowTunnel();
     } catch (error) {
@@ -677,8 +682,11 @@ export class AppController extends EventEmitter<AppControllerEvents> {
   }
 
   private bestServer(servers: TunnelServer[]): TunnelServer | null {
-    const nonRussian = servers.filter((item) => item.countryCode.toUpperCase() !== "RU");
-    const candidates = nonRussian.length ? nonRussian : servers;
+    // TUIC is an explicit per-server choice; automatic selection keeps Xray protocols.
+    const xrayServers = servers.filter((item) => !item.tuic);
+    const pool = xrayServers.length ? xrayServers : servers;
+    const nonRussian = pool.filter((item) => item.countryCode.toUpperCase() !== "RU");
+    const candidates = nonRussian.length ? nonRussian : pool;
     return candidates.reduce<TunnelServer | null>((best, candidate) => {
       if (!best) return candidate;
       const bestLatency = this.state.serverLatencies[best.id];

@@ -14,6 +14,8 @@ let helperURL = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinks
 let resourcesURL = helperURL.deletingLastPathComponent().deletingLastPathComponent()
 let bundleURL = resourcesURL.deletingLastPathComponent().deletingLastPathComponent()
 let coreURL = resourcesURL.appendingPathComponent("xray/xray")
+// TUIC v5 sidecar: Xray has no TUIC client, so a bundled sing-box carries it.
+let tuicCoreURL = resourcesURL.appendingPathComponent("singbox/sing-box")
 
 struct HelperError: Error, CustomStringConvertible {
     let description: String
@@ -371,6 +373,102 @@ func installUpdate(parent: pid_t, stagedPath: String, expectedVersion: String, r
     }
 }
 
+struct TuicParameters {
+    let address: String
+    let port: Int
+    let uuid: String
+    let password: String
+    let serverName: String
+    let alpn: [String]
+    let congestionControl: String
+    let udpRelayMode: String
+    let caCertificatePEM: String
+}
+
+func matches(_ value: String, _ pattern: String) -> Bool {
+    value.range(of: pattern, options: .regularExpression) != nil
+}
+
+/// Validates TUIC parameters received over IPC. Only an IPv4 literal is accepted
+/// so the privileged process never resolves names for TUIC, and the pinned CA
+/// must parse as a certificate; system roots are never trusted for TUIC.
+func parseTuicParameters(_ value: Any) throws -> TuicParameters {
+    guard let object = value as? [String: Any],
+          let address = object["address"] as? String, let port = object["port"] as? Int,
+          let uuid = object["uuid"] as? String, let password = object["password"] as? String,
+          let serverName = object["serverName"] as? String, let alpn = object["alpn"] as? [String],
+          let congestionControl = object["congestionControl"] as? String,
+          let udpRelayMode = object["udpRelayMode"] as? String,
+          let pem = object["caCertificatePem"] as? String else { throw HelperError("Некорректные параметры TUIC") }
+    var v4 = in_addr()
+    let octets = address.split(separator: ".").compactMap { Int($0) }
+    try require(inet_pton(AF_INET, address, &v4) == 1 && octets.count == 4 && octets[0] != 0 && octets[0] != 127, "Некорректный адрес TUIC-сервера")
+    try require((1...65535).contains(port), "Некорректный порт TUIC-сервера")
+    try require(matches(uuid, "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"), "Некорректный идентификатор TUIC")
+    try require(matches(password, "^[A-Za-z0-9_-]{16,128}$"), "Некорректный ключ TUIC")
+    try require(serverName.utf8.count <= 253 && matches(serverName, "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$"), "Некорректное имя TUIC-сервера")
+    try require(!alpn.isEmpty && alpn.count <= 4 && alpn.allSatisfy { matches($0, "^[A-Za-z0-9./-]{1,32}$") }, "Некорректный ALPN TUIC")
+    try require(["bbr", "cubic", "new_reno"].contains(congestionControl) && ["native", "quic"].contains(udpRelayMode), "Некорректный режим TUIC")
+    let header = "-----BEGIN CERTIFICATE-----\n", footer = "\n-----END CERTIFICATE-----\n"
+    try require(pem.utf8.count <= 8192 && pem.hasPrefix(header) && pem.hasSuffix(footer), "Некорректный сертификат TUIC")
+    let body = String(pem.dropFirst(header.count).dropLast(footer.count))
+    try require(matches(body, "^[A-Za-z0-9+/=\\n]+$"), "Некорректный сертификат TUIC")
+    guard let der = Data(base64Encoded: body.replacingOccurrences(of: "\n", with: "")),
+          SecCertificateCreateWithData(nil, der as CFData) != nil else { throw HelperError("Некорректный сертификат TUIC") }
+    return TuicParameters(address: address, port: port, uuid: uuid, password: password, serverName: serverName, alpn: alpn, congestionControl: congestionControl, udpRelayMode: udpRelayMode, caCertificatePEM: pem)
+}
+
+/// The complete sing-box configuration is constructed here; nothing but the
+/// validated parameters above crosses the IPC boundary.
+func tuicCoreConfig(_ tuic: TuicParameters, localPort: Int, username: String, secret: String, interface: String) -> [String: Any] {
+    [
+        "log": ["level": "warn", "timestamp": false],
+        "inbounds": [["type": "socks", "tag": "levik-tuic-in", "listen": "127.0.0.1", "listen_port": localPort,
+                      "users": [["username": username, "password": secret]]]],
+        "outbounds": [["type": "tuic", "tag": "levik-tuic", "server": tuic.address, "server_port": tuic.port,
+                       "uuid": tuic.uuid, "password": tuic.password, "congestion_control": tuic.congestionControl,
+                       "udp_relay_mode": tuic.udpRelayMode, "heartbeat": "10s", "bind_interface": interface,
+                       "tls": ["enabled": true, "server_name": tuic.serverName, "alpn": tuic.alpn, "certificate": [tuic.caCertificatePEM]]]],
+        "route": ["final": "levik-tuic"],
+    ]
+}
+
+func freeLoopbackPort() throws -> Int {
+    let descriptor = socket(AF_INET, SOCK_STREAM, 0)
+    try require(descriptor >= 0, "Не удалось выделить локальный порт")
+    defer { close(descriptor) }
+    var address = sockaddr_in()
+    address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    address.sin_family = sa_family_t(AF_INET)
+    address.sin_addr.s_addr = inet_addr("127.0.0.1")
+    address.sin_port = 0
+    var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+    let bound = withUnsafePointer(to: &address) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(descriptor, $0, length) } }
+    try require(bound == 0, "Не удалось выделить локальный порт")
+    let named = withUnsafeMutablePointer(to: &address) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(descriptor, $0, &length) } }
+    try require(named == 0, "Не удалось выделить локальный порт")
+    return Int(UInt16(bigEndian: address.sin_port))
+}
+
+func loopbackPortAccepts(_ port: Int) -> Bool {
+    let descriptor = socket(AF_INET, SOCK_STREAM, 0)
+    guard descriptor >= 0 else { return false }
+    defer { close(descriptor) }
+    var address = sockaddr_in()
+    address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    address.sin_family = sa_family_t(AF_INET)
+    address.sin_addr.s_addr = inet_addr("127.0.0.1")
+    address.sin_port = in_port_t(UInt16(port).bigEndian)
+    return withUnsafePointer(to: &address) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } } == 0
+}
+
+func randomToken(_ length: Int) throws -> String {
+    let alphabet = Array("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
+    var bytes = [UInt8](repeating: 0, count: length)
+    try require(SecRandomCopyBytes(kSecRandomDefault, length, &bytes) == errSecSuccess, "Не удалось создать ключ сессии")
+    return String(bytes.map { alphabet[Int($0) % alphabet.count] })
+}
+
 func tunnelGroup() throws -> gid_t {
     let name = "_levikvpn"
     if let existing = getgrnam(name) {
@@ -404,6 +502,8 @@ final class TunnelSession {
     var diagnostics = CoreDiagnostics()
     var outboundInterface = ""
     var dnsAudit: DNSAudit?
+    var tuicChild: Process?
+    var tuicStopping = false
 
     init(group: gid_t, signature: Data) throws {
         self.group = group; self.signature = signature
@@ -415,19 +515,32 @@ final class TunnelSession {
     }
 
     func status() throws -> [String: Any] {
-        let running = child?.isRunning ?? false
-        if let child, !running { exitCode = child.terminationStatus; self.child = nil }
+        let running = (child?.isRunning ?? false) && (tuicChild?.isRunning ?? true)
+        if let child, !child.isRunning { exitCode = child.terminationStatus; self.child = nil }
         let rules = (killSwitch || dnsProtection) ? try run("/sbin/pfctl", ["-a", anchor, "-sr"]).1 : ""
         let enabled = (killSwitch || dnsProtection) ? try run("/sbin/pfctl", ["-s", "info"]).1.contains("Status: Enabled") : false
         return ["running": running, "killSwitch": killSwitch && enabled && rules.contains("levik-kill-switch"), "dnsProtection": dnsProtection && enabled && rules.contains("levik-dns"), "pid": child.map { Int($0.processIdentifier) } as Any? ?? NSNull(), "exitCode": exitCode.map { Int($0) } as Any? ?? NSNull()]
     }
 
-    func start(_ supplied: [String: Any], killSwitch: Bool, dns: Bool) throws {
+    func start(_ supplied: [String: Any], killSwitch: Bool, dns: Bool, tuic: TuicParameters?) throws {
         try validateConfig(supplied)
         try require(try signedBundleHash() == signature, "Приложение обновилось. Перезапустите Levik VPN.")
         try stop()
         outboundInterface = try primaryOutboundInterface()
         var config = supplied
+        // Any failure before the session is reported running must not leave the sidecar behind.
+        var sidecarCommitted = false
+        defer { if !sidecarCommitted { stopTuic() } }
+        if let tuic {
+            guard var outbounds = config["outbounds"] as? [[String: Any]], var first = outbounds.first,
+                  first["protocol"] as? String == "socks",
+                  let settings = first["settings"] as? [String: Any], settings["address"] as? String == "127.0.0.1",
+                  settings["port"] as? Int == 1, settings.count == 2 else { throw HelperError("Некорректный VPN-профиль TUIC") }
+            let local = try startTuic(tuic)
+            first["settings"] = ["address": "127.0.0.1", "port": local.port, "user": local.username, "pass": local.secret]
+            outbounds[0] = first
+            config["outbounds"] = outbounds
+        }
         // All privileged settings are constructed here, never accepted from IPC.
         guard let number = (30..<240).first(where: { if_nametoindex("utun\($0)") == 0 }) else { throw HelperError("Нет свободного VPN-интерфейса") }
         interface = "utun\(number)"
@@ -493,12 +606,71 @@ final class TunnelSession {
                 do { try verifyConnectivity() }
                 catch { try stop(); throw error }
                 if dns { try applyDNS() }
+                sidecarCommitted = true
                 return
             }
             Thread.sleep(forTimeInterval: 0.15)
         }
         try stop()
         throw HelperError("VPN-туннель не запустился. Защита сохраняется до отключения VPN.")
+    }
+
+    func startTuic(_ tuic: TuicParameters) throws -> (port: Int, username: String, secret: String) {
+        try require(FileManager.default.isExecutableFile(atPath: tuicCoreURL.path), "Компонент TUIC не найден. Переустановите Levik VPN.")
+        let port = try freeLoopbackPort()
+        let username = try randomToken(24), secret = try randomToken(40)
+        let configPath = runtimeDirectory + "/tuic-core-config.json"
+        let workDirectory = runtimeDirectory + "/tuic"
+        if mkdir(workDirectory, 0o700) != 0 { try require(errno == EEXIST, "Не удалось подготовить каталог TUIC") }
+        let bytes = try JSONSerialization.data(withJSONObject: tuicCoreConfig(tuic, localPort: port, username: username, secret: secret, interface: outboundInterface))
+        try require(FileManager.default.createFile(atPath: configPath, contents: bytes, attributes: [.posixPermissions: 0o600]), "Не удалось записать конфигурацию TUIC")
+        chmod(configPath, 0o600)
+        let check = try run(tuicCoreURL.path, ["check", "-c", configPath, "-D", workDirectory])
+        try require(check.0 == 0, "Ядро TUIC отклонило профиль")
+        let process = Process()
+        process.executableURL = tuicCoreURL
+        process.arguments = ["run", "-c", configPath, "-D", workDirectory, "--disable-color"]
+        process.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "en_US.UTF-8"]
+        let output = Pipe()
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = output
+        process.standardError = output
+        tuicStopping = false
+        // A sidecar exit ends the Xray core too, so the app sees the tunnel stop
+        // and reconnects instead of silently blackholing selected traffic.
+        process.terminationHandler = { [weak self] exited in
+            // A late handler of a replaced sidecar must not stop the next session's core.
+            guard let self, !self.tuicStopping, self.tuicChild === exited, let core = self.child, core.isRunning else { return }
+            kill(core.processIdentifier, SIGTERM)
+        }
+        try process.run()
+        diagnostics.drain(output)
+        tuicChild = process
+        var info = proc_bsdinfo()
+        if proc_pidinfo(process.processIdentifier, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout<proc_bsdinfo>.size)) > 0 {
+            try? JSONSerialization.data(withJSONObject: ["pid": Int(process.processIdentifier), "started": info.pbi_start_tvsec]).write(to: URL(fileURLWithPath: runtimeDirectory + "/tuic-core.json"), options: .atomic)
+            chmod(runtimeDirectory + "/tuic-core.json", 0o600)
+        }
+        let deadline = Date().addingTimeInterval(8)
+        while Date() < deadline && process.isRunning {
+            if loopbackPortAccepts(port) { return (port, username, secret) }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        stopTuic()
+        throw HelperError("Ядро TUIC не запустилось")
+    }
+
+    func stopTuic() {
+        tuicStopping = true
+        if let tuicChild, tuicChild.isRunning {
+            tuicChild.terminate()
+            let deadline = Date().addingTimeInterval(3)
+            while tuicChild.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.05) }
+            if tuicChild.isRunning { kill(tuicChild.processIdentifier, SIGKILL); tuicChild.waitUntilExit() }
+        }
+        tuicChild = nil
+        try? FileManager.default.removeItem(atPath: runtimeDirectory + "/tuic-core.json")
+        try? FileManager.default.removeItem(atPath: runtimeDirectory + "/tuic-core-config.json")
     }
 
     func verifyConnectivity() throws {
@@ -521,6 +693,7 @@ final class TunnelSession {
         }
         child = nil
         try? FileManager.default.removeItem(atPath: runtimeDirectory + "/core.json")
+        stopTuic()
         if let store { SCDynamicStoreRemoveValue(store, dnsKey) }
         // utun routes disappear with the descriptor even after SIGKILL. PF is
         // deliberately retained across replacement and unexpected core exit.
@@ -602,7 +775,13 @@ final class TunnelSession {
     }
 
     func recoverOrphanedCore() throws {
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: runtimeDirectory + "/core.json")),
+        recoverOrphanedProcess(record: "/tuic-core.json", executable: tuicCoreURL)
+        try? FileManager.default.removeItem(atPath: runtimeDirectory + "/tuic-core-config.json")
+        recoverOrphanedProcess(record: "/core.json", executable: coreURL)
+    }
+
+    func recoverOrphanedProcess(record: String, executable: URL) {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: runtimeDirectory + record)),
               let saved = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let pidValue = saved["pid"] as? Int32, pidValue > 1,
               let started = saved["started"] as? UInt64 else { return }
@@ -611,12 +790,12 @@ final class TunnelSession {
         guard proc_pidinfo(pidValue, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout<proc_bsdinfo>.size)) > 0,
               info.pbi_uid == 0, info.pbi_gid == group, info.pbi_start_tvsec == started,
               proc_pidpath(pidValue, &path, UInt32(path.count)) > 0,
-              String(cString: path) == coreURL.path else { return }
+              String(cString: path) == executable.path else { return }
         kill(pidValue, SIGTERM)
         let deadline = Date().addingTimeInterval(5)
         while kill(pidValue, 0) == 0 && Date() < deadline { Thread.sleep(forTimeInterval: 0.05) }
         if kill(pidValue, 0) == 0 { kill(pidValue, SIGKILL) }
-        try? FileManager.default.removeItem(atPath: runtimeDirectory + "/core.json")
+        try? FileManager.default.removeItem(atPath: runtimeDirectory + record)
     }
 }
 
@@ -720,7 +899,8 @@ func serve(parent: pid_t) throws {
                     case "start":
                         guard let config = object["config"] as? [String: Any], let killSwitch = object["killSwitch"] as? Bool, let dns = object["dnsProtection"] as? Bool else { throw HelperError("Некорректный VPN-профиль") }
                         if let dnsServer = object["dnsServer"] as? String { try require(isIP(dnsServer), "Некорректный DNS"); session.dnsServer = dnsServer }
-                        try session.start(config, killSwitch: killSwitch, dns: dns)
+                        let tuic = try object["tuic"].map(parseTuicParameters)
+                        try session.start(config, killSwitch: killSwitch, dns: dns, tuic: tuic)
                     case "stop": try session.stop()
                     case "protection":
                         guard let killSwitch = object["killSwitch"] as? Bool, let dns = object["dnsProtection"] as? Bool else { throw HelperError("Некорректные параметры защиты") }
@@ -782,6 +962,16 @@ func selfTest() throws {
     try require(isIP("1.1.1.1") && isIP("::1") && !isIP("999.1.1.1"), "Address validation failed")
     try require(coreErrorCategory("[Warning] failed to dial: connection refused at private.example with credential") == "VPN-сервер отклонил соединение", "Diagnostic classification failed")
     try require(coreErrorCategory("private profile payload") == nil, "Diagnostic privacy regression")
+    let testCA = "-----BEGIN CERTIFICATE-----\nMIIBLTCB1KADAgECAgkAlrWlAi74LtUwCgYIKoZIzj0EAwIwEjEQMA4GA1UEAwwH\nVGVzdCBDQTAeFw0yNjEwMDkwNjMzMzlaFw0zNjEwMDYwNjMzMzlaMBIxEDAOBgNV\nBAMMB1Rlc3QgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQMkvwcR00n8QEH\n8ejxpVyrdEu2mitTmHTzJVVb+D2knRhRrsjtu5BW/5G6nQhjImjchTZSEvYh58TT\nUkbLgujloxMwETAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0gAMEUCIQCS\n7Jk2t47s5ODjcF4pvBsQRoz/9CyV/roiGAHkKEDm4wIgJ2W+0/H9Nr4eiUTxs3o6\nLwMmI0nbP/oM6G+6pDD3fl4=\n-----END CERTIFICATE-----\n"
+    let validTuic: [String: Any] = ["address": "94.156.114.70", "port": 8443, "uuid": "123e4567-e89b-42d3-a456-426614174000", "password": "_EnbjPjIrpPjymZ63JYDPCUY7WN9ZvWv", "serverName": "www.samsung.com", "alpn": ["h3"], "congestionControl": "bbr", "udpRelayMode": "native", "caCertificatePem": testCA]
+    let parsedTuic = try parseTuicParameters(validTuic)
+    let tuicConfig = tuicCoreConfig(parsedTuic, localPort: 40000, username: "user", secret: "secret", interface: "en0")
+    try require(Set(tuicConfig.keys) == ["log", "inbounds", "outbounds", "route"], "TUIC config shape regression")
+    for (key, value) in [("address", "127.0.0.1"), ("address", "example.com"), ("address", "::1"), ("uuid", "x"), ("password", "short"), ("serverName", "bad name"), ("caCertificatePem", "not a certificate"), ("congestionControl", "reno")] as [(String, Any)] {
+        var candidate = validTuic; candidate[key] = value
+        do { _ = try parseTuicParameters(candidate); throw HelperError("TUIC validation regression: \(key)") }
+        catch let error as HelperError { if error.description.hasPrefix("TUIC validation regression") { throw error } }
+    }
     try require(validUpdateVersion("1.2.3") && !validUpdateVersion("1.2") && !validUpdateVersion("1.2.3-beta"), "Update version validation failed")
     print("Native helper self-tests passed")
 }

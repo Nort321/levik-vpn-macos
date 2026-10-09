@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { EventEmitter } from "node:events";
 import { XrayStatsClient } from "./xrayStats";
 import { isTunnelHealthy } from "./tunnelHealth";
+import type { TuicEndpoint } from "../../shared/contracts";
 
 interface XrayEvents {
   log: [line: string];
@@ -23,7 +24,7 @@ export class XrayManager extends EventEmitter<XrayEvents> {
   private healthCheckRunning = false;
   private healthFailures = 0;
 
-  async start(config: Record<string, unknown>): Promise<void> {
+  async start(config: Record<string, unknown>, tuic?: TuicEndpoint): Promise<void> {
     this.stopping = true;
     this.stopStatsPolling();
     this.running = false;
@@ -32,6 +33,8 @@ export class XrayManager extends EventEmitter<XrayEvents> {
       killSwitch: macHelper.killSwitch,
       dnsProtection: macHelper.dnsProtection,
       dnsServer: dnsServerFromConfig(config),
+      // The helper launches sing-box for TUIC under the same isolated group as Xray.
+      ...(tuic ? { tuic } : {}),
     });
     this.running = true;
     this.stopping = false;

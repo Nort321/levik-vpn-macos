@@ -32,8 +32,8 @@ export function buildXrayConfig(
   server: TunnelServer,
   settings: AppSettings,
 ): Record<string, unknown> {
-  const antiDpiOutbound = withAntiDpi(server, settings);
-  const selectedOutbound = withAlternateXhttpMux(antiDpiOutbound);
+  const antiDpiOutbound = server.tuic ? server.outbound : withAntiDpi(server, settings);
+  const selectedOutbound = server.tuic ? tuicLocalOutbound(server.tag) : withAlternateXhttpMux(antiDpiOutbound);
   const directDomains = [...profile.directDomains];
   const proxyDomains = [...profile.proxyDomains];
   if (settings.routingMode === "blockedOnly") proxyDomains.push(...BLOCKED_DOMAINS);
@@ -96,6 +96,17 @@ export function buildXrayConfig(
     stats: {},
   };
 }
+
+/**
+ * Xray reaches a TUIC server through a loopback SOCKS5 hop to the bundled
+ * sing-box. Port and credentials are generated per session by the privileged
+ * helper, which rewrites this placeholder before Xray starts.
+ */
+export function tuicLocalOutbound(tag: string): Record<string, unknown> {
+  return { tag, protocol: "socks", settings: { address: "127.0.0.1", port: TUIC_PLACEHOLDER_PORT } };
+}
+
+export const TUIC_PLACEHOLDER_PORT = 1;
 
 function withAlternateXhttpMux(outbound: Record<string, unknown>): Record<string, unknown> {
   if ("mux" in outbound || outbound.protocol !== "vless") return outbound;

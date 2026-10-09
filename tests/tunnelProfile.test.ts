@@ -58,6 +58,7 @@ describe("macOS tunnel profile", () => {
         "vless://11111111-1111-4111-8111-111111111111@example.com:443?security=tls#VLESS",
         "trojan://test-password@example.com:443#Trojan",
         "hysteria2://test-password@example.com:443#Hysteria2",
+        "hysteria2://test-password@example.com:2443?sni=hy2.example.com&obfs=salamander&obfs-password=test-obfs-password#Hysteria2-obfuscated",
       ].join("\n") },
     })), "subscription-1");
     for (const server of profile.servers) {
@@ -65,6 +66,13 @@ describe("macOS tunnel profile", () => {
       expect(() => execFileSync(resolve("build", "native", process.arch, "levik-helper"), ["--validate-config"], {
         input: JSON.stringify(config), timeout: 10_000, stdio: ["pipe", "pipe", "pipe"],
       })).not.toThrow();
+      if (server.outbound.protocol === "hysteria") {
+        const assets = resolve("vendor", "xray", `darwin-${process.arch}`);
+        expect(() => execFileSync(resolve(assets, "xray"), ["run", "-test", "-format", "json", "-config", "stdin:"], {
+          input: JSON.stringify(config), timeout: 10_000, stdio: ["pipe", "pipe", "pipe"],
+          env: { ...process.env, XRAY_LOCATION_ASSET: assets },
+        })).not.toThrow();
+      }
     }
   });
 
@@ -119,6 +127,35 @@ describe("macOS tunnel profile", () => {
   it("rejects a profile issued for another subscription", () => {
     const profile = { version: 1, profileId: "p", subscriptionId: "one", issuedAt: new Date().toISOString(), source: { mediaType: "text/plain", content: "vless://11111111-1111-4111-8111-111111111111@example.com:443#Server" } };
     expect(() => prepareTunnelProfile(Buffer.from(JSON.stringify(profile)), "two")).toThrow(/подписке/);
+  });
+
+  it.each(["hysteria2", "hy2"])("preserves Salamander from %s subscriptions through Anti-DPI configuration", (scheme) => {
+    const source = `${scheme}://secret@example.com:2443?sni=hy2.example.com&obfs=salamander&obfs-password=S%2Band%26%3DSecret#Obfuscated`;
+    for (const content of [source, Buffer.from(source).toString("base64")]) {
+      const prepared = prepareTunnelProfile(Buffer.from(JSON.stringify({
+        version: 1, profileId: "salamander-profile", subscriptionId: "subscription-1",
+        source: { mediaType: "text/plain", content },
+      })), "subscription-1");
+      const config = buildXrayConfig(prepared, prepared.servers[0]!, { ...settings, antiDpiEnabled: true });
+      expect(config).toHaveProperty("outbounds.0.streamSettings.finalmask", {
+        udp: [{ type: "salamander", settings: { password: "S+and&=Secret" } }],
+      });
+      expect(config).toHaveProperty("outbounds.0.streamSettings.tlsSettings.serverName", "hy2.example.com");
+      expect(config).toHaveProperty("outbounds.0.streamSettings.hysteriaSettings.auth", "secret");
+      expect(config).toHaveProperty("outbounds.0.settings.port", 2443);
+    }
+  });
+
+  it.each([
+    "obfs=gecko&obfs-password=valid-password",
+    "obfs=salamander",
+    "obfs=salamander&obfs-password=abc",
+    `obfs=salamander&obfs-password=${"x".repeat(1025)}`,
+  ])("rejects unsupported or invalid Hysteria2 obfuscation instead of dropping it", (query) => {
+    expect(() => prepareTunnelProfile(Buffer.from(JSON.stringify({
+      version: 1, profileId: "invalid-obfs", subscriptionId: "subscription-1",
+      source: { mediaType: "text/plain", content: `hysteria2://secret@example.com:2443?${query}` },
+    })), "subscription-1")).toThrow(/обфускации Hysteria2/);
   });
 
   it("supports Hysteria2 share links", () => {

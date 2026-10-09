@@ -98,15 +98,22 @@ export function buildXrayConfig(
 }
 
 /**
- * Xray reaches a TUIC server through a loopback SOCKS5 hop to the bundled
- * sing-box. Port and credentials are generated per session by the privileged
- * helper, which rewrites this placeholder before Xray starts.
+ * Xray reaches a TUIC server through a loopback VLESS hop to the bundled
+ * sing-box. VLESS carries UDP inside the TCP stream: Xray binds its UDP
+ * sockets to the physical interface, so a SOCKS5 UDP relay on loopback would
+ * drop DNS and QUIC. Port and user id are generated per session by the
+ * privileged helper, which rewrites this placeholder before Xray starts.
  */
 export function tuicLocalOutbound(tag: string): Record<string, unknown> {
-  return { tag, protocol: "socks", settings: { address: "127.0.0.1", port: TUIC_PLACEHOLDER_PORT } };
+  return {
+    tag,
+    protocol: "vless",
+    settings: { vnext: [{ address: "127.0.0.1", port: TUIC_PLACEHOLDER_PORT, users: [{ id: TUIC_PLACEHOLDER_ID, encryption: "none" }] }] },
+  };
 }
 
 export const TUIC_PLACEHOLDER_PORT = 1;
+export const TUIC_PLACEHOLDER_ID = "00000000-0000-4000-8000-000000000000";
 
 function withAlternateXhttpMux(outbound: Record<string, unknown>): Record<string, unknown> {
   if ("mux" in outbound || outbound.protocol !== "vless") return outbound;

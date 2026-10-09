@@ -420,11 +420,13 @@ func parseTuicParameters(_ value: Any) throws -> TuicParameters {
 
 /// The complete sing-box configuration is constructed here; nothing but the
 /// validated parameters above crosses the IPC boundary.
-func tuicCoreConfig(_ tuic: TuicParameters, localPort: Int, username: String, secret: String, interface: String) -> [String: Any] {
+/// Xray reaches it over loopback VLESS: UDP travels inside that TCP stream,
+/// because Xray binds its own UDP sockets to the physical interface.
+func tuicCoreConfig(_ tuic: TuicParameters, localPort: Int, localID: String, interface: String) -> [String: Any] {
     [
         "log": ["level": "warn", "timestamp": false],
-        "inbounds": [["type": "socks", "tag": "levik-tuic-in", "listen": "127.0.0.1", "listen_port": localPort,
-                      "users": [["username": username, "password": secret]]]],
+        "inbounds": [["type": "vless", "tag": "levik-tuic-in", "listen": "127.0.0.1", "listen_port": localPort,
+                      "users": [["uuid": localID]]]],
         "outbounds": [["type": "tuic", "tag": "levik-tuic", "server": tuic.address, "server_port": tuic.port,
                        "uuid": tuic.uuid, "password": tuic.password, "congestion_control": tuic.congestionControl,
                        "udp_relay_mode": tuic.udpRelayMode, "heartbeat": "10s", "bind_interface": interface,
@@ -462,11 +464,17 @@ func loopbackPortAccepts(_ port: Int) -> Bool {
     return withUnsafePointer(to: &address) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } } == 0
 }
 
-func randomToken(_ length: Int) throws -> String {
-    let alphabet = Array("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
-    var bytes = [UInt8](repeating: 0, count: length)
-    try require(SecRandomCopyBytes(kSecRandomDefault, length, &bytes) == errSecSuccess, "Не удалось создать ключ сессии")
-    return String(bytes.map { alphabet[Int($0) % alphabet.count] })
+/// Per-session VLESS user id for the loopback hop (random UUIDv4).
+func randomSessionID() throws -> String {
+    var bytes = [UInt8](repeating: 0, count: 16)
+    try require(SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess, "Не удалось создать ключ сессии")
+    bytes[6] = (bytes[6] & 0x0f) | 0x40
+    bytes[8] = (bytes[8] & 0x3f) | 0x80
+    let hex = bytes.map { String(format: "%02x", $0) }.joined()
+    let parts = [0..<8, 8..<12, 12..<16, 16..<20, 20..<32].map { range in
+        String(hex[hex.index(hex.startIndex, offsetBy: range.lowerBound)..<hex.index(hex.startIndex, offsetBy: range.upperBound)])
+    }
+    return parts.joined(separator: "-")
 }
 
 func tunnelGroup() throws -> gid_t {
@@ -533,11 +541,12 @@ final class TunnelSession {
         defer { if !sidecarCommitted { stopTuic() } }
         if let tuic {
             guard var outbounds = config["outbounds"] as? [[String: Any]], var first = outbounds.first,
-                  first["protocol"] as? String == "socks",
-                  let settings = first["settings"] as? [String: Any], settings["address"] as? String == "127.0.0.1",
-                  settings["port"] as? Int == 1, settings.count == 2 else { throw HelperError("Некорректный VPN-профиль TUIC") }
+                  first["protocol"] as? String == "vless", Set(first.keys) == ["tag", "protocol", "settings"],
+                  let settings = first["settings"] as? [String: Any], settings.count == 1,
+                  let vnext = settings["vnext"] as? [[String: Any]], vnext.count == 1,
+                  vnext[0]["address"] as? String == "127.0.0.1", vnext[0]["port"] as? Int == 1 else { throw HelperError("Некорректный VPN-профиль TUIC") }
             let local = try startTuic(tuic)
-            first["settings"] = ["address": "127.0.0.1", "port": local.port, "user": local.username, "pass": local.secret]
+            first["settings"] = ["vnext": [["address": "127.0.0.1", "port": local.port, "users": [["id": local.id, "encryption": "none"]]]]]
             outbounds[0] = first
             config["outbounds"] = outbounds
         }
@@ -615,14 +624,14 @@ final class TunnelSession {
         throw HelperError("VPN-туннель не запустился. Защита сохраняется до отключения VPN.")
     }
 
-    func startTuic(_ tuic: TuicParameters) throws -> (port: Int, username: String, secret: String) {
+    func startTuic(_ tuic: TuicParameters) throws -> (port: Int, id: String) {
         try require(FileManager.default.isExecutableFile(atPath: tuicCoreURL.path), "Компонент TUIC не найден. Переустановите Levik VPN.")
         let port = try freeLoopbackPort()
-        let username = try randomToken(24), secret = try randomToken(40)
+        let id = try randomSessionID()
         let configPath = runtimeDirectory + "/tuic-core-config.json"
         let workDirectory = runtimeDirectory + "/tuic"
         if mkdir(workDirectory, 0o700) != 0 { try require(errno == EEXIST, "Не удалось подготовить каталог TUIC") }
-        let bytes = try JSONSerialization.data(withJSONObject: tuicCoreConfig(tuic, localPort: port, username: username, secret: secret, interface: outboundInterface))
+        let bytes = try JSONSerialization.data(withJSONObject: tuicCoreConfig(tuic, localPort: port, localID: id, interface: outboundInterface))
         try require(FileManager.default.createFile(atPath: configPath, contents: bytes, attributes: [.posixPermissions: 0o600]), "Не удалось записать конфигурацию TUIC")
         chmod(configPath, 0o600)
         let check = try run(tuicCoreURL.path, ["check", "-c", configPath, "-D", workDirectory])
@@ -653,7 +662,7 @@ final class TunnelSession {
         }
         let deadline = Date().addingTimeInterval(8)
         while Date() < deadline && process.isRunning {
-            if loopbackPortAccepts(port) { return (port, username, secret) }
+            if loopbackPortAccepts(port) { return (port, id) }
             Thread.sleep(forTimeInterval: 0.05)
         }
         stopTuic()
@@ -965,8 +974,10 @@ func selfTest() throws {
     let testCA = "-----BEGIN CERTIFICATE-----\nMIIBLTCB1KADAgECAgkAlrWlAi74LtUwCgYIKoZIzj0EAwIwEjEQMA4GA1UEAwwH\nVGVzdCBDQTAeFw0yNjEwMDkwNjMzMzlaFw0zNjEwMDYwNjMzMzlaMBIxEDAOBgNV\nBAMMB1Rlc3QgQ0EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQMkvwcR00n8QEH\n8ejxpVyrdEu2mitTmHTzJVVb+D2knRhRrsjtu5BW/5G6nQhjImjchTZSEvYh58TT\nUkbLgujloxMwETAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0gAMEUCIQCS\n7Jk2t47s5ODjcF4pvBsQRoz/9CyV/roiGAHkKEDm4wIgJ2W+0/H9Nr4eiUTxs3o6\nLwMmI0nbP/oM6G+6pDD3fl4=\n-----END CERTIFICATE-----\n"
     let validTuic: [String: Any] = ["address": "94.156.114.70", "port": 8443, "uuid": "123e4567-e89b-42d3-a456-426614174000", "password": "_EnbjPjIrpPjymZ63JYDPCUY7WN9ZvWv", "serverName": "www.samsung.com", "alpn": ["h3"], "congestionControl": "bbr", "udpRelayMode": "native", "caCertificatePem": testCA]
     let parsedTuic = try parseTuicParameters(validTuic)
-    let tuicConfig = tuicCoreConfig(parsedTuic, localPort: 40000, username: "user", secret: "secret", interface: "en0")
+    let tuicConfig = tuicCoreConfig(parsedTuic, localPort: 40000, localID: "123e4567-e89b-42d3-a456-426614174000", interface: "en0")
     try require(Set(tuicConfig.keys) == ["log", "inbounds", "outbounds", "route"], "TUIC config shape regression")
+    try require((tuicConfig["inbounds"] as? [[String: Any]])?.first?["type"] as? String == "vless", "TUIC loopback hop must carry UDP over TCP")
+    try require(try randomSessionID().range(of: "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", options: .regularExpression) != nil, "Session id generation failed")
     for (key, value) in [("address", "127.0.0.1"), ("address", "example.com"), ("address", "::1"), ("uuid", "x"), ("password", "short"), ("serverName", "bad name"), ("caCertificatePem", "not a certificate"), ("congestionControl", "reno")] as [(String, Any)] {
         var candidate = validTuic; candidate[key] = value
         do { _ = try parseTuicParameters(candidate); throw HelperError("TUIC validation regression: \(key)") }

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
 import { resolve } from "node:path";
 import { prepareTunnelProfile } from "../src/main/vpn/tunnelProfile";
-import { buildXrayConfig, TUIC_PLACEHOLDER_PORT } from "../src/main/vpn/xrayConfig";
+import { buildXrayConfig, TUIC_PLACEHOLDER_ID, TUIC_PLACEHOLDER_PORT } from "../src/main/vpn/xrayConfig";
 import { activeVariant, groupServers, serverProtocolShortLabel } from "../src/shared/serverGroups";
 import type { AppSettings } from "../src/shared/contracts";
 
@@ -64,12 +64,16 @@ describe("TUIC profile support", () => {
     expect(profile.servers.filter((server) => server.tuic)).toHaveLength(0);
   });
 
-  it("routes a TUIC server through the loopback SOCKS placeholder accepted by Xray", () => {
+  it("routes a TUIC server through the loopback VLESS placeholder accepted by Xray", () => {
     const profile = profileFrom(SUBSCRIPTION);
     const server = profile.servers.find((item) => item.tuic)!;
     const config = buildXrayConfig(profile, server, settings);
     const outbounds = config.outbounds as Array<Record<string, unknown>>;
-    expect(outbounds[0]).toEqual({ tag: server.tag, protocol: "socks", settings: { address: "127.0.0.1", port: TUIC_PLACEHOLDER_PORT } });
+    expect(outbounds[0]).toEqual({
+      tag: server.tag,
+      protocol: "vless",
+      settings: { vnext: [{ address: "127.0.0.1", port: TUIC_PLACEHOLDER_PORT, users: [{ id: TUIC_PLACEHOLDER_ID, encryption: "none" }] }] },
+    });
     // Anti-DPI fragmentation targets TCP TLS and must not wrap the QUIC sidecar hop.
     expect(outbounds.some((outbound) => outbound.tag === "levik-fragment")).toBe(false);
     const assets = resolve("vendor", "xray", `darwin-${process.arch}`);

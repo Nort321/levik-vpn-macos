@@ -406,3 +406,9 @@ h1 { font-size: 25px; }
 
 .telemetry-notice { display: flex; flex-direction: column; gap: 14px; padding: 16px 18px; margin-bottom: 16px; }
 .telemetry-notice-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+
+.announcement { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 16px 18px 16px 22px; margin-bottom: 16px; border-left: 3px solid var(--blue); }
+.announcement.warning { border-left-color: var(--warning); }
+.announcement.critical { border-left-color: var(--red); }
+.announcement-copy .card-caption { max-width: 680px; white-space: pre-line; }
+.announcement-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }

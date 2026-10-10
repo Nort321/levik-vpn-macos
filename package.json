@@ -26,6 +26,14 @@
   },
   "build": {
     "appId": "com.leviknet.vpn.macos",
+    "protocols": [
+      {
+        "name": "Levik VPN",
+        "schemes": [
+          "levik"
+        ]
+      }
+    ],
     "productName": "Levik VPN",
     "artifactName": "LevikVPN-macOS-${version}-${arch}.${ext}",
     "directories": {

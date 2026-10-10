@@ -27,6 +27,7 @@ const settings: AppSettings = {
   splitTunnelProcesses: [],
   connectionTelemetry: false,
   telemetryNoticeShown: false,
+  syncSettings: false,
 };
 
 describe("macOS tunnel profile", () => {

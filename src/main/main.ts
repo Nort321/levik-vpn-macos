@@ -1,8 +1,10 @@
-import { app, BrowserWindow, dialog, Menu, nativeImage, powerMonitor, Tray } from "electron";
+import { app, BrowserWindow, dialog, Menu, nativeImage, Notification, powerMonitor, Tray } from "electron";
 import { join } from "node:path";
-import type { AppSnapshot, ConnectionStatus } from "../shared/contracts";
+import type { AppSnapshot, AppTab, ConnectionStatus } from "../shared/contracts";
 import { AppController } from "./appController";
 import { registerIpc } from "./ipc";
+import { DEEP_LINK_SCHEME, parseDeepLink } from "./platform/links";
+import type { AppNotice } from "./platform/notices";
 import { runReleaseChecks } from "./releaseChecks";
 
 let mainWindow: BrowserWindow | null = null;
@@ -10,13 +12,26 @@ let tray: Tray | null = null;
 let controller: AppController | null = null;
 let quitting = false;
 let lastTrayKey = "";
+let started = false;
+/** A levik:// link that arrived before the window was ready. */
+let pendingLink: AppTab | null = null;
 
 const singleInstance = app.requestSingleInstanceLock();
 if (!singleInstance) app.quit();
 
 app.on("second-instance", () => showWindow());
 
+// macOS delivers levik:// links as an event, also the one that launched the app,
+// so the listener is registered before "ready".
+app.on("open-url", (event, url) => {
+  event.preventDefault();
+  const tab = parseDeepLink(url);
+  if (tab) openLink(tab);
+});
+
 app.whenReady().then(async () => {
+  // Installed builds only: a development run would register the Electron binary instead.
+  if (app.isPackaged) app.setAsDefaultProtocolClient(DEEP_LINK_SCHEME);
   Menu.setApplicationMenu(Menu.buildFromTemplate([
     { label: app.name, submenu: [{ role: "about" }, { type: "separator" }, { role: "hide" }, { role: "hideOthers" }, { role: "unhide" }, { type: "separator" }, { label: "Выйти из Levik VPN", accelerator: "Command+Q", click: requestQuit }] },
     { label: "Правка", submenu: [{ role: "undo" }, { role: "redo" }, { type: "separator" }, { role: "cut" }, { role: "copy" }, { role: "paste" }, { role: "selectAll" }] },
@@ -27,6 +42,7 @@ app.whenReady().then(async () => {
   registerIpc(controller, mainWindow);
   controller.on("changed", updateTray);
   controller.on("updateInstalling", () => { quitting = true; });
+  controller.on("notify", showNotice);
   powerMonitor.on("suspend", () => controller?.recordPowerEvent("suspend"));
   powerMonitor.on("resume", () => {
     controller?.recordPowerEvent("resume");
@@ -36,6 +52,14 @@ app.whenReady().then(async () => {
   await controller.initialize();
   updateTray(controller.snapshot());
   mainWindow.show();
+  started = true;
+  if (pendingLink) {
+    const tab = pendingLink;
+    pendingLink = null;
+    // The renderer listens for navigation once its page has loaded.
+    if (mainWindow.webContents.isLoading()) mainWindow.webContents.once("did-finish-load", () => openLink(tab));
+    else openLink(tab);
+  }
   if (process.argv.includes('--release-checks')) void runReleaseChecks(controller);
   else if (process.argv.includes('--release-dns-checks')) void runReleaseChecks(controller, true);
 }).catch((error: unknown) => {
@@ -149,6 +173,22 @@ function trayStatus(status: ConnectionStatus): string {
 
 function applicationIconPath(): string {
   return join(__dirname, "..", "assets", "icon.png");
+}
+
+function openLink(tab: AppTab): void {
+  if (!controller || !mainWindow || !started) {
+    pendingLink = tab;
+    return;
+  }
+  showWindow();
+  controller.handleDeepLink(tab);
+}
+
+function showNotice(notice: AppNotice): void {
+  if (!Notification.isSupported()) return;
+  const notification = new Notification({ title: notice.title, body: notice.body });
+  notification.on("click", () => openLink(notice.tab));
+  notification.show();
 }
 
 function showWindow(): void {

@@ -25,6 +25,8 @@ const settings: AppSettings = {
   antiDpiInterval: "10-20",
   splitTunnelMode: "off",
   splitTunnelProcesses: [],
+  connectionTelemetry: false,
+  telemetryNoticeShown: false,
 };
 
 describe("macOS tunnel profile", () => {

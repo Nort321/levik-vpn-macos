@@ -395,3 +395,6 @@ h1 { font-size: 25px; }
 }
 
 .nav-button.active { color: var(--text); }
+
+.telemetry-notice { display: flex; flex-direction: column; gap: 14px; padding: 16px 18px; margin-bottom: 16px; }
+.telemetry-notice-actions { display: flex; flex-wrap: wrap; gap: 8px; }

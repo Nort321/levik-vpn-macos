@@ -10,6 +10,10 @@ interface XrayEvents {
   log: [line: string];
   exit: [code: number | null, expected: boolean];
   stats: [downloadBytes: number, uploadBytes: number];
+  /** Periodic traffic check: null when traffic flows, otherwise failure codes. */
+  health: [failureCodes: string[] | null];
+  /** Repeated failed checks are about to stop the tunnel with an exit event. */
+  unhealthy: [];
 }
 
 export class XrayManager extends EventEmitter<XrayEvents> {
@@ -52,14 +56,16 @@ export class XrayManager extends EventEmitter<XrayEvents> {
     return this.running;
   }
 
-  async isHealthy(): Promise<boolean> {
+  async isHealthy(onFailure?: (codes: string[]) => void): Promise<boolean> {
     if (!this.running) return false;
     const generation = this.statsGeneration;
     try {
       await this.statsClient.query("inbound>>>levik-tun-in>>>");
-      const healthy = await isTunnelHealthy();
+      const healthy = await isTunnelHealthy({ onFailure });
       return healthy && this.running && generation === this.statsGeneration;
     } catch {
+      // The core's stats API is not answering, so it is not serving traffic.
+      onFailure?.(["no_vpn_network"]);
       return false;
     }
   }
@@ -94,10 +100,13 @@ export class XrayManager extends EventEmitter<XrayEvents> {
     const generation = this.statsGeneration;
     this.healthCheckRunning = true;
     try {
-      const healthy = await this.isHealthy();
+      let codes = ["other"];
+      const healthy = await this.isHealthy((failures) => { codes = failures; });
       if (generation !== this.statsGeneration || !this.running) return;
       this.healthFailures = healthy ? 0 : this.healthFailures + 1;
+      this.emit("health", healthy ? null : codes);
       if (this.healthFailures < 3) return;
+      this.emit("unhealthy");
       this.emit("log", "VPN перестал передавать трафик. Восстановление соединения…");
       this.running = false;
       this.stopStatsPolling();

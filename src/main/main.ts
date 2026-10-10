@@ -27,7 +27,11 @@ app.whenReady().then(async () => {
   registerIpc(controller, mainWindow);
   controller.on("changed", updateTray);
   controller.on("updateInstalling", () => { quitting = true; });
-  powerMonitor.on("resume", () => void controller?.restoreAfterSystemResume());
+  powerMonitor.on("suspend", () => controller?.recordPowerEvent("suspend"));
+  powerMonitor.on("resume", () => {
+    controller?.recordPowerEvent("resume");
+    void controller?.restoreAfterSystemResume();
+  });
   powerMonitor.on("unlock-screen", () => void controller?.restoreAfterSystemResume());
   await controller.initialize();
   updateTray(controller.snapshot());

@@ -25,7 +25,13 @@ import { MacKillSwitch } from "./macos/protection";
 import { macHelper } from "./macos/helperClient";
 import { normalizeApplicationRule } from "./macos/processes";
 import { isIP } from "node:net";
+import { join } from "node:path";
 import { AppUpdater } from "./update/appUpdater";
+import { defaultRouteNetworkType } from "./macos/networkType";
+import { helperStartFailure, protocolOf } from "./telemetry/codes";
+import { ConnectionTelemetry } from "./telemetry/connectionTelemetry";
+import { DiskLog } from "./diagnostics/diskLog";
+import type { AttemptCause, AttemptStage, EndBy, PowerState, SessionSettings, SessionTrigger } from "./telemetry/sessionRecorder";
 
 interface AppControllerEvents {
   changed: [snapshot: AppSnapshot];
@@ -52,6 +58,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   antiDpiInterval: "10-20",
   splitTunnelMode: "off",
   splitTunnelProcesses: [],
+  connectionTelemetry: true,
+  telemetryNoticeShown: false,
 };
 
 const SETTINGS_SCHEMA_VERSION = 3;
@@ -83,6 +91,14 @@ export class AppController extends EventEmitter<AppControllerEvents> {
   private resumePromise: Promise<void> | null = null;
   private killSwitchHealthTimer: ReturnType<typeof setInterval> | null = null;
   private killSwitchHealthCheckRunning = false;
+  private readonly telemetry = new ConnectionTelemetry(join(app.getPath("userData"), "telemetry"), {
+    platform: "macos",
+    app: app.getVersion(),
+    os: macosMajorVersion(),
+  });
+  private diskLog: DiskLog | null = null;
+  private nextAttemptCause: AttemptCause = "initial";
+  private unhealthyExit = false;
   private state: AppSnapshot = {
     appVersion: app.getVersion(),
     tab: "home",
@@ -115,18 +131,21 @@ export class AppController extends EventEmitter<AppControllerEvents> {
   }
 
   async initialize(): Promise<void> {
+    this.diskLog = new DiskLog(join(app.getPath("userData"), "logs"));
+    this.diskLog.write(`Levik VPN ${app.getVersion()} started on macOS ${macosMajorVersion()}`);
     this.identity = await this.loadIdentity();
     this.api = new MobileApiClient(
       process.env.LEVIK_API_ORIGIN ?? "https://api.leviknet.org",
       new RequestSigner(this.identity),
       app.getVersion(),
     );
-    this.xray.on("log", (line) => this.addLog(line));
-    this.xray.on("exit", (code, expected) => this.handleXrayExit(code, expected));
-    this.xray.on("stats", (downloadBytes, uploadBytes) => this.handleTrafficStats(downloadBytes, uploadBytes));
+    this.bindCoreEvents();
     this.accessToken = await this.loadString("access_token");
     this.state.sessionAvailable = this.accessToken !== null;
     this.state.settings = await this.loadSettings();
+    await this.telemetry.setEnabled(telemetryAllowed(this.state.settings)).catch((error: unknown) => {
+      this.addLog(`Статистика подключений: ${messageOf(error)}`);
+    });
     const recoveredKillSwitch = await this.killSwitch.recover();
     if (recoveredKillSwitch && !this.state.settings.killSwitch) {
       await this.killSwitch.disable();
@@ -156,7 +175,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
       if (this.state.settings.autoConnectOnLaunch) {
         try {
           await this.pingServers();
-          await this.connect();
+          await this.connect("auto_connect");
         } catch (error) {
           this.addLog(`Автоподключение: ${messageOf(error)}`);
         }
@@ -272,7 +291,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     }
   }
 
-  async connect(): Promise<void> {
+  async connect(trigger: SessionTrigger = "user"): Promise<void> {
     if (this.xray.isRunning() || this.state.status === "connecting") return;
     if (!this.profile) {
       const subscriptionId = this.state.selectedSubscriptionId;
@@ -284,14 +303,26 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     }
     const server = this.selectedServer();
     if (!server || !this.profile) throw new Error("Выберите VPN-сервер");
+    if (!this.telemetry.active) {
+      // The operator and network kind are only visible outside the tunnel.
+      const [network] = await Promise.all([defaultRouteNetworkType(), this.telemetry.prepareNetwork()]);
+      this.telemetry.begin(trigger, sessionSettings(this.state.settings));
+      if (network) this.telemetry.record((session) => session.setNetwork(network));
+      this.nextAttemptCause = "initial";
+    }
     this.resetTrafficStats();
     this.patch({ status: "connecting", statusDetail: `Подключение через ${server.name}…`, busy: true, downloadBytes: 0, uploadBytes: 0 });
+    const progress = this.recordAttempt(server, this.nextAttemptCause);
+    this.nextAttemptCause = "reconnect";
     try {
       if (this.state.settings.killSwitch) this.killSwitch.prepareForTunnelStart();
       if (this.state.settings.preventDnsLeaks) await this.dnsLeakProtection.enable();
+      progress.reach("profile", "config_invalid");
       const config = buildXrayConfig(this.profile, server, this.state.settings);
       this.lastConfig = config;
       this.lastTuic = server.tuic;
+      // The helper verifies traffic through the tunnel before it reports success.
+      progress.reach("core", "core_start_failed");
       await this.startXray(config);
       this.lockdownActive = false;
       this.reconnectAttempts = 0;
@@ -300,16 +331,24 @@ export class AppController extends EventEmitter<AppControllerEvents> {
         statusDetail: `Защищено через ${server.name}`,
         sessionStartedAt: Date.now(),
       });
+      this.recordConnected();
     } catch (error) {
       await this.dnsLeakProtection.disable().catch((cleanupError: unknown) => this.addLog(`DNS-защита: ${messageOf(cleanupError)}`));
       this.patch({ status: "error", statusDetail: messageOf(error), sessionStartedAt: null });
+      progress.fail(error);
+      void this.telemetry.finish("error", progress.code);
       throw error;
     } finally {
       this.patch({ busy: false });
     }
   }
 
-  async disconnect(): Promise<void> {
+  disconnect(): Promise<void> {
+    return this.stopConnection("user", "user");
+  }
+
+  private async stopConnection(by: EndBy, code: string | null): Promise<void> {
+    void this.telemetry.finish(by, code);
     if (!this.xray.isRunning()) {
       await Promise.all([
         this.dnsLeakProtection.disable(),
@@ -341,6 +380,8 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     await this.secureStore.put("settings", Buffer.from(JSON.stringify(serializeSettings(next))));
     this.applyLoginItemSettings();
     this.emitChanged();
+    if (telemetryAllowed(previous) !== telemetryAllowed(next)) await this.telemetry.setEnabled(telemetryAllowed(next));
+    this.telemetry.record((session) => session.updateSettings(sessionSettings(next)));
     if (!previous.automaticServer && next.automaticServer) void this.pingServers();
     if (previous.killSwitch && !next.killSwitch) await this.killSwitch.disable();
     if (!previous.killSwitch && next.killSwitch && reconnect) {
@@ -354,8 +395,9 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     }
   }
 
-  async shutdown(): Promise<void> {
+  async shutdown(reason: "quit" | "app_update" = "quit"): Promise<void> {
     this.loginGeneration += 1;
+    const saved = this.telemetry.finish("system", reason === "app_update" ? "app_update" : null);
     this.stopKillSwitchHealthMonitor();
     try {
       await this.xray.stop();
@@ -365,6 +407,9 @@ export class AppController extends EventEmitter<AppControllerEvents> {
         this.killSwitch.disable(),
       ]);
       await macHelper.shutdown();
+      await saved;
+      this.telemetry.dispose();
+      await this.diskLog?.flush();
     }
   }
 
@@ -421,7 +466,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
   async installUpdate(): Promise<void> {
     if (!this.updater) throw new Error("Модуль обновлений недоступен");
     await this.updater.install(
-      () => this.shutdown(),
+      () => this.shutdown("app_update"),
       () => this.emit("updateInstalling"),
     );
   }
@@ -429,22 +474,39 @@ export class AppController extends EventEmitter<AppControllerEvents> {
   async restoreAfterSystemResume(): Promise<void> {
     if (this.resumePromise) return this.resumePromise;
     if (!this.lastConfig || !["connected", "reconnecting"].includes(this.state.status)) return;
+    let progress: AttemptProgress | null = null;
     this.resumePromise = (async () => {
       await delay(1_500);
-      if (await this.xray.isHealthy()) return;
+      let codes = ["other"];
+      const healthy = await this.xray.isHealthy((failures) => { codes = failures; });
+      this.telemetry.record((session) => {
+        if (healthy) session.probeSucceeded();
+        else session.probeFailed(codes);
+      });
+      if (healthy) return;
       const config = this.lastConfig;
       if (!config || !["connected", "reconnecting"].includes(this.state.status)) return;
       this.patch({ status: "reconnecting", statusDetail: "Восстановление после сна или разблокировки…" });
+      progress = this.recordRecoveryAttempt("resume");
       if (this.state.settings.preventDnsLeaks) await this.dnsLeakProtection.enable();
+      progress?.reach("core", "core_start_failed");
       await this.startXray(config);
       this.lockdownActive = false;
       this.reconnectAttempts = 0;
       this.patch({ status: "connected", statusDetail: "Защищённое соединение восстановлено" });
+      this.recordConnected();
     })().catch((error: unknown) => {
+      progress?.fail(error);
       this.addLog(`Восстановление после сна: ${messageOf(error)}`);
       this.handleXrayExit(null, false);
     }).finally(() => { this.resumePromise = null; });
     return this.resumePromise;
+  }
+
+  /** Sleep explains drops that are not the server's fault. */
+  recordPowerEvent(state: Extract<PowerState, "suspend" | "resume">): void {
+    this.telemetry.record((session) => session.power(state));
+    if (state === "suspend") void this.telemetry.persist();
   }
 
   private async pollLogin(challenge: AuthChallengeResponse, generation: number): Promise<void> {
@@ -578,11 +640,32 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     });
   }
 
-  private handleXrayExit(code: number | null, expected: boolean): void {
+  private bindCoreEvents(): void {
+    this.xray.on("log", (line) => this.addLog(line));
+    this.xray.on("exit", (code, expected) => this.handleCoreExit(code, expected));
+    this.xray.on("health", (codes) => this.telemetry.record((session) => {
+      if (codes) session.probeFailed(codes);
+      else session.probeSucceeded();
+    }));
+    this.xray.on("unhealthy", () => { this.unhealthyExit = true; });
+    this.xray.on("stats", (downloadBytes, uploadBytes) => this.handleTrafficStats(downloadBytes, uploadBytes));
+  }
+
+  private handleCoreExit(code: number | null, expected: boolean): void {
+    const unhealthy = this.unhealthyExit;
+    this.unhealthyExit = false;
+    // A tunnel stopped for failing traffic checks is already in the timeline as probe failures.
+    if (!expected && !unhealthy) this.telemetry.record((session) => session.coreExit(code, false));
+    this.handleXrayExit(code, expected, unhealthy ? "gave_up" : "core_exited");
+  }
+
+  private handleXrayExit(code: number | null, expected: boolean, endCode: "core_exited" | "gave_up" = "gave_up"): void {
     if (expected) return;
     this.patch({ status: "reconnecting", statusDetail: `Туннель остановлен (код ${code ?? "?"}). Восстановление…` });
     if (!this.state.settings.autoReconnect || !this.lastConfig) {
       this.patch({ status: "error", statusDetail: "VPN-туннель неожиданно остановлен", sessionStartedAt: null });
+      this.telemetry.record((session) => session.recovery(this.state.settings.killSwitch ? "lockdown" : "gave_up"));
+      void this.telemetry.finish("error", endCode);
       return;
     }
     const delayMs = Math.min(30_000, 1_000 * 2 ** Math.min(this.reconnectAttempts++, 5));
@@ -594,11 +677,15 @@ export class AppController extends EventEmitter<AppControllerEvents> {
   private scheduleTunnelRestore(delayMs: number): void {
     setTimeout(() => {
       if (this.state.status !== "reconnecting" || !this.lastConfig) return;
+      const progress = this.recordRecoveryAttempt("reconnect");
+      progress?.reach("core", "core_start_failed");
       void this.startXray(this.lastConfig).then(() => {
         this.lockdownActive = false;
         this.reconnectAttempts = 0;
         this.patch({ status: "connected", statusDetail: "Защищённое соединение восстановлено" });
+        this.recordConnected();
       }).catch((error: unknown) => {
+        progress?.fail(error);
         this.addLog(`Переподключение: ${messageOf(error)}`);
         this.handleXrayExit(null, false);
       });
@@ -663,6 +750,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
   }
 
   private async stopTunnelForReplacement(): Promise<void> {
+    this.nextAttemptCause = "server_switch";
     this.patch({ status: "reconnecting", statusDetail: "Применение изменений соединения…" });
     await this.xray.stop();
     this.lockdownActive = false;
@@ -709,7 +797,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     } catch (error) {
       if (isAuthenticationRejected(error)) {
         try {
-          await this.disconnect();
+          await this.stopConnection("error", "auth_deadline");
         } catch (cleanupError) {
           this.addLog(`Завершение истёкшей сессии: ${messageOf(cleanupError)}`);
         }
@@ -719,13 +807,48 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     }
   }
 
+  /** Records an attempt; the returned progress names the step that failed. */
+  private recordAttempt(server: TunnelServer, cause: AttemptCause): AttemptProgress {
+    this.telemetry.record((session) => session.attempt(server.name, protocolOf(server), cause));
+    let stage: AttemptStage = "tun";
+    let code = "helper_failed";
+    return {
+      get code() { return code; },
+      reach: (nextStage, nextCode) => { stage = nextStage; code = nextCode; },
+      fail: (error) => {
+        // The helper names the failed step more precisely than the app's progress.
+        const failure = error instanceof Error ? helperStartFailure(error.message) : null;
+        if (failure) [stage, code] = failure;
+        this.telemetry.record((session) => session.attemptFailed(stage, code));
+      },
+    };
+  }
+
+  /** The app restarts the same server; macOS has no automatic failover. */
+  private recordRecoveryAttempt(cause: AttemptCause): AttemptProgress | null {
+    const server = this.selectedServer();
+    this.telemetry.record((session) => session.recovery("reconnect_same"));
+    return server ? this.recordAttempt(server, cause) : null;
+  }
+
+  private recordConnected(): void {
+    this.telemetry.record((session) => session.connected());
+    // Reports leave through the working tunnel, after it has settled.
+    this.telemetry.flushSoon();
+  }
+
   private addLog(line: string): void {
     const cleaned = line.replace(/[\r\n]/g, " ").slice(0, 1_000);
+    this.diskLog?.write(cleaned);
     this.state.logs = [`${new Date().toLocaleTimeString("ru-RU")}  ${cleaned}`, ...this.state.logs].slice(0, 200);
     this.emitChanged();
   }
 
   private patch(patch: Partial<AppSnapshot>): void {
+    if (patch.status && patch.status !== this.state.status) {
+      const detail = patch.statusDetail ?? null;
+      this.diskLog?.write(`Состояние: ${patch.status}${detail ? ` — ${detail}` : ""}`);
+    }
     this.state = { ...this.state, ...patch };
     this.emitChanged();
   }
@@ -739,6 +862,31 @@ export class AppController extends EventEmitter<AppControllerEvents> {
       app.setLoginItemSettings({ openAtLogin: this.state.settings.launchAtLogin });
     }
   }
+}
+
+interface AttemptProgress {
+  readonly code: string;
+  reach(stage: AttemptStage, code: string): void;
+  fail(error: unknown): void;
+}
+
+function telemetryAllowed(settings: AppSettings): boolean {
+  return settings.connectionTelemetry && settings.telemetryNoticeShown;
+}
+
+function sessionSettings(settings: AppSettings): SessionSettings {
+  return {
+    killSwitch: settings.killSwitch,
+    autoRecovery: settings.autoReconnect,
+    splitTunnel: settings.splitTunnelMode !== "off" || settings.routingMode !== "global",
+  };
+}
+
+/** Electron reports the product version ("15.1.0"), not the Darwin kernel's. */
+function macosMajorVersion(): string {
+  const version = typeof process.getSystemVersion === "function" ? process.getSystemVersion() : "";
+  const major = /^(\d{1,3})\./.exec(version)?.[1];
+  return major ?? "unknown";
 }
 
 function normalizeActivationCode(value: string): string {
@@ -796,6 +944,8 @@ function validateSettings(value: AppSettings): AppSettings {
       const normalized = normalizeSplitTunnelProcess(name);
       return normalized ? [normalized] : [];
     }))].slice(0, 200),
+    connectionTelemetry: Boolean(value.connectionTelemetry),
+    telemetryNoticeShown: Boolean(value.telemetryNoticeShown),
   };
 }
 

@@ -38,6 +38,8 @@ import { createSupportNote, MAX_SUPPORT_NOTE_BYTES, supportNoteText } from "./di
 import { supportReportText } from "./diagnostics/supportReport";
 import type { AttemptCause, AttemptStage, EndBy, PowerState, SessionSettings, SessionTrigger } from "./telemetry/sessionRecorder";
 import { cabinetFallbackUrl, isAllowedExternalUrl, isHandoffUrl } from "./platform/links";
+import { ServiceEndpointsStore } from "./platform/serviceEndpoints";
+import { DEFAULT_API_ORIGIN } from "./api/apiEndpoints";
 import { expiryNotices, NoticeState } from "./platform/notices";
 import type { AppNotice } from "./platform/notices";
 import {
@@ -71,6 +73,9 @@ const ACCOUNT_CHECK_INTERVAL_MS = 6 * 60 * 60_000;
 const SETTINGS_SYNC_INTERVAL_MS = 30 * 60_000;
 const SETTINGS_PUSH_DELAY_MS = 1_500;
 const LINK_REFRESH_INTERVAL_MS = 30_000;
+/** Signed host list: checked twice a day, and at most once a minute when every host fails. */
+const ENDPOINTS_REFRESH_MS = 12 * 60 * 60_000;
+const ENDPOINTS_RETRY_MS = 60_000;
 
 const DEFAULT_SETTINGS: AppSettings = {
   routingMode: "global",
@@ -134,6 +139,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
   private diskLog: DiskLog | null = null;
   private readonly remoteConfig = new RemoteConfigClient("macos", app.getVersion());
   private readonly remoteConfigStore = new RemoteConfigStore(join(app.getPath("userData"), "remote-config.json"));
+  private readonly endpointsStore = new ServiceEndpointsStore(join(app.getPath("userData"), "service-endpoints.json"));
   private remoteStored: StoredRemoteConfig | null = null;
   private remoteRefresh: Promise<void> | null = null;
   private readonly notices = new NoticeState(join(app.getPath("userData"), "notices.json"));
@@ -184,10 +190,13 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     this.diskLog = new DiskLog(join(app.getPath("userData"), "logs"));
     this.diskLog.write(`Levik VPN ${app.getVersion()} started on macOS ${macosMajorVersion()}`);
     this.identity = await this.loadIdentity();
+    // Signed hosts from the last run first, so a blocked domain is not even tried.
+    await this.endpointsStore.load();
     this.api = new MobileApiClient(
-      process.env.LEVIK_API_ORIGIN ?? "https://api.leviknet.org",
+      process.env.LEVIK_API_ORIGIN ?? DEFAULT_API_ORIGIN,
       new RequestSigner(this.identity),
       app.getVersion(),
+      () => this.endpointsStore.refresh(ENDPOINTS_RETRY_MS),
     );
     this.bindCoreEvents();
     this.accessToken = await this.loadString("access_token");
@@ -220,6 +229,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     this.emitChanged();
     // Before any tunnel: protocol advice describes the user's own operator.
     void this.refreshRemoteConfig();
+    void this.endpointsStore.refresh();
     this.backgroundTimer = setInterval(() => void this.backgroundTick(), BACKGROUND_TICK_MS);
     if (this.accessToken) {
       try {
@@ -665,6 +675,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
 
   private async backgroundTick(): Promise<void> {
     const now = Date.now();
+    void this.endpointsStore.refresh(ENDPOINTS_REFRESH_MS);
     const stored = this.remoteStored;
     if (!stored || now - stored.fetchedAt >= stored.config.refreshAfterSeconds * 1_000) await this.refreshRemoteConfig();
     else await this.updateAnnouncements();

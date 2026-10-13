@@ -617,6 +617,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
 
   /** Sleep explains drops that are not the server's fault. */
   recordPowerEvent(state: Extract<PowerState, "suspend" | "resume">): void {
+    this.xray.setSuspended(state === "suspend");
     this.telemetry.record((session) => session.power(state));
     if (state === "suspend") void this.telemetry.persist();
   }
@@ -1130,8 +1131,9 @@ interface AttemptProgress {
   fail(error: unknown): void;
 }
 
+// Development runs are the developer's tests, not users' connections.
 function telemetryAllowed(settings: AppSettings): boolean {
-  return settings.connectionTelemetry && settings.telemetryNoticeShown;
+  return app.isPackaged && settings.connectionTelemetry && settings.telemetryNoticeShown;
 }
 
 function sessionSettings(settings: AppSettings): SessionSettings {

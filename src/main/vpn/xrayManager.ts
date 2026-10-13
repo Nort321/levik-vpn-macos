@@ -27,6 +27,7 @@ export class XrayManager extends EventEmitter<XrayEvents> {
   private healthTimer: ReturnType<typeof setInterval> | null = null;
   private healthCheckRunning = false;
   private healthFailures = 0;
+  private suspended = false;
 
   async start(config: Record<string, unknown>, tuic?: TuicEndpoint): Promise<void> {
     this.stopping = true;
@@ -95,14 +96,24 @@ export class XrayManager extends EventEmitter<XrayEvents> {
     this.statsClient.close();
   }
 
+  /**
+   * While the Mac sleeps, maintenance wakes still fire timers but the network
+   * is down, so probes would fail and restart a tunnel nobody is using. The
+   * controller checks the tunnel itself after resume.
+   */
+  setSuspended(suspended: boolean): void {
+    this.suspended = suspended;
+    this.healthFailures = 0;
+  }
+
   private async checkTrafficHealth(): Promise<void> {
-    if (!this.running || this.healthCheckRunning) return;
+    if (!this.running || this.healthCheckRunning || this.suspended) return;
     const generation = this.statsGeneration;
     this.healthCheckRunning = true;
     try {
       let codes = ["other"];
       const healthy = await this.isHealthy((failures) => { codes = failures; });
-      if (generation !== this.statsGeneration || !this.running) return;
+      if (generation !== this.statsGeneration || !this.running || this.suspended) return;
       this.healthFailures = healthy ? 0 : this.healthFailures + 1;
       this.emit("health", healthy ? null : codes);
       if (this.healthFailures < 3) return;

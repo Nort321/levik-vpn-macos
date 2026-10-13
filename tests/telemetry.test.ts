@@ -27,6 +27,9 @@ describe("telemetry codes", () => {
   it("maps helper start failures to stages without passing their text on", () => {
     expect(helperStartFailure("VPN-сервер не передаёт данные: Ошибка согласования REALITY; VPN-сервер не ответил вовремя.")).toEqual(["handshake", "reality_auth"]);
     expect(helperStartFailure("VPN-сервер не передаёт данные: VPN-сервер не ответил вовремя.")).toEqual(["handshake", "handshake_timeout"]);
+    expect(helperStartFailure("VPN-сервер не передаёт данные: Ошибка DNS внутри туннеля; VPN-сервер не ответил вовремя.")).toEqual(["handshake", "handshake_timeout"]);
+    expect(helperStartFailure("VPN-сервер не передаёт данные: Ошибка DNS внутри туннеля.")).toEqual(["handshake", "dns_tunnel"]);
+    expect(helperStartFailure("VPN-сервер не передаёт данные: Не удалось разрешить адрес VPN-сервера; VPN-сервер не ответил вовремя.")).toEqual(["handshake", "dns"]);
     expect(helperStartFailure("VPN-сервер не передаёт данные. Выберите другой сервер.")).toEqual(["verify", "timeout"]);
     expect(helperStartFailure("VPN-туннель не запустился. Защита сохраняется до отключения VPN.")).toEqual(["core", "core_start_failed"]);
     expect(helperStartFailure("Разрешение macOS не получено. Повторите подключение")).toEqual(["tun", "permission_denied"]);

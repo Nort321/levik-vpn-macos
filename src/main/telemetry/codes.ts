@@ -30,16 +30,19 @@ export function probeErrorCode(error: unknown): string {
 }
 
 // The helper (native/Helper.swift) reduces core output to fixed categories
-// and reports start failures with these messages; match them to codes.
+// and reports start failures with these messages; match them to codes. The
+// summary can hold several categories, so causes come before symptoms: DNS
+// inside the tunnel fails whenever the server itself does not answer.
 const HANDSHAKE_DETAILS: ReadonlyArray<readonly [RegExp, string]> = [
   [/отклонил соединение/, "refused"],
   [/REALITY/, "reality_auth"],
   [/сертификат/i, "tls"],
   [/авторизации|отклонил профиль/, "auth_failed"],
-  [/разрешить адрес|DNS/, "dns"],
+  [/разрешить адрес/, "dns"],
   [/недоступна|Нет маршрута|исходящий сетевой интерфейс/, "unreachable"],
   [/не ответил вовремя/, "handshake_timeout"],
   [/закрыл соединение/, "reset"],
+  [/DNS/, "dns_tunnel"],
 ];
 
 const START_FAILURES: ReadonlyArray<readonly [RegExp, AttemptStage, string]> = [

@@ -44,6 +44,23 @@ describe("macOS traffic recovery", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it("does not probe or restart the tunnel while the Mac sleeps", async () => {
+    const exit = vi.fn();
+    manager.on("exit", exit);
+    await manager.start({});
+    await vi.advanceTimersByTimeAsync(60_000);
+    manager.setSuspended(true);
+    mocks.probe.mockClear();
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(mocks.probe).not.toHaveBeenCalled();
+    expect(exit).not.toHaveBeenCalled();
+    manager.setSuspended(false);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(exit).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(exit).toHaveBeenCalledOnce();
+  });
+
   it("discards a pending failure when the tunnel is replaced", async () => {
     const exit = vi.fn();
     manager.on("exit", exit);

@@ -11,3 +11,5 @@ build/icon.icns
 *.p8
 *.key
 coverage/
+*.orig
+*.rej

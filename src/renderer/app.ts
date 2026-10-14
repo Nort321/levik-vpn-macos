@@ -261,6 +261,7 @@ function renderProfile(): string {
         ${switchSetting("Запуск с macOS", "Открывать Levik VPN после входа", "launchAtLogin", state.settings.launchAtLogin)}
         ${switchSetting("Закрытие в трей", "Кнопка закрытия скрывает приложение", "closeToTray", state.settings.closeToTray)}
         ${switchSetting("Синхронизация настроек", syncHelp(), "syncSettings", state.settings.syncSettings)}
+        ${switchSetting("Показывать статус «в сети»", "На странице устройств и в других ваших приложениях: открыт ли Levik VPN и включён ли VPN. Без IP-адресов и истории", "sharePresence", state.settings.sharePresence)}
         ${switchSetting("Значок в строке меню", "Показывать значок состояния Levik VPN", "showTrayIcon", state.settings.showTrayIcon)}
         ${switchSetting("Статистика качества подключения", "Анонимно сообщать об обрывах и ошибках подключения. Без IP-адресов, сайтов и данных аккаунта", "connectionTelemetry", state.settings.connectionTelemetry)}
         ${selectSetting("Оформление", "Единый стиль Levik VPN", "theme", state.settings.theme, [["system","Системная"],["dark","Тёмная"],["light","Светлая"],["amoled","AMOLED"]])}
@@ -403,7 +404,7 @@ function bindPageEvents(): void {
   document.querySelectorAll<HTMLElement>("[data-setting]").forEach((button) => button.addEventListener("click", () => {
     const currentState = state;
     if (!currentState) return;
-    const key = button.dataset.setting as "automaticServer" | "autoReconnect" | "autoConnectOnLaunch" | "killSwitch" | "useDoh" | "preventDnsLeaks" | "antiDpiEnabled" | "launchAtLogin" | "closeToTray" | "showTrayIcon" | "connectionTelemetry" | "syncSettings";
+    const key = button.dataset.setting as "automaticServer" | "autoReconnect" | "autoConnectOnLaunch" | "killSwitch" | "useDoh" | "preventDnsLeaks" | "antiDpiEnabled" | "launchAtLogin" | "closeToTray" | "showTrayIcon" | "connectionTelemetry" | "syncSettings" | "sharePresence";
     // Choosing in Settings also answers the first-run notice.
     const patch: Partial<AppSettings> = key === "connectionTelemetry"
       ? { connectionTelemetry: !currentState.settings.connectionTelemetry, telemetryNoticeShown: true }

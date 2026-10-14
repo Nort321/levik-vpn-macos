@@ -28,6 +28,7 @@ const settings: AppSettings = {
   connectionTelemetry: false,
   telemetryNoticeShown: false,
   syncSettings: false,
+  sharePresence: true,
 };
 
 describe("macOS tunnel profile", () => {

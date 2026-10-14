@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="https://github.com/Nort321/levik-vpn-macos/releases/latest">Скачать для Mac</a> ·
-  <a href="https://leviknet.com">Официальный сайт</a> ·
+  <a href="https://leviknet.org">Официальный сайт</a> ·
   <a href="https://t.me/leviksupportbot">Поддержка</a>
 </p>
 
@@ -55,7 +55,7 @@
 ## Нужна помощь?
 
 Напишите в [поддержку Levik](https://t.me/leviksupportbot).
-Информация об обработке данных доступна в [политике конфиденциальности](https://leviknet.com/legal/privacy).
+Информация об обработке данных доступна в [политике конфиденциальности](https://leviknet.org/legal/privacy).
 
 Статистика качества подключения — анонимные отчёты о том, удалось ли подключиться, когда и почему соединение оборвалось и как приложение его восстановило. Отчёт содержит название сервера, протокол, коды ошибок и оператора сети; IP-адреса, посещённые сайты, данные аккаунта и устройства не отправляются. Приложение спрашивает согласие при первом запуске, отключить статистику можно в «Профиль и настройки». Полный формат отчётов — [docs/connection-telemetry.md](https://github.com/Nort321/levik-vpn/blob/main/docs/connection-telemetry.md), код — `src/main/telemetry/`.
 

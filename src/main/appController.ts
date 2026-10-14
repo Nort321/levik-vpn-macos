@@ -60,6 +60,14 @@ import {
   withoutConfirmed,
 } from "./platform/settingsSync";
 import type { SyncedSettings } from "./platform/settingsSync";
+import {
+  canonicalNodeList,
+  isCanonicalNodeList,
+  parseNodeList,
+  reconcileFavorites,
+  serversByNode,
+  unionNodeLists,
+} from "./platform/favoriteNodes";
 
 interface AppControllerEvents {
   changed: [snapshot: AppSnapshot];
@@ -91,6 +99,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   showTrayIcon: true,
   preventDnsLeaks: true,
   favoriteServerIds: [],
+  favoriteNodes: null,
   antiDpiEnabled: false,
   antiDpiPackets: "tlshello",
   antiDpiLength: "100-200",
@@ -144,6 +153,10 @@ export class AppController extends EventEmitter<AppControllerEvents> {
   private remoteRefresh: Promise<void> | null = null;
   private readonly notices = new NoticeState(join(app.getPath("userData"), "notices.json"));
   private settingsRevision = 0;
+  /** Whether this computer's favourites were joined with the account's list (favoriteNodes.ts). */
+  private favoritesJoined = false;
+  private favoriteReconciledLocal = new Set<string>();
+  private reconcilingFavorites = false;
   private pendingSync: SyncedSettings = {};
   private settingsSyncChain: Promise<void> = Promise.resolve();
   private settingsPushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -227,6 +240,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     this.applyLoginItemSettings();
     this.state.busy = false;
     this.emitChanged();
+    void this.reconcileFavorites();
     // Before any tunnel: protocol advice describes the user's own operator.
     void this.refreshRemoteConfig();
     void this.endpointsStore.refresh();
@@ -452,6 +466,9 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     this.applyLoginItemSettings();
     this.emitChanged();
     if (origin === "user") await this.recordSyncedChanges(previous, next);
+    if (previous.favoriteNodes !== next.favoriteNodes || previous.favoriteServerIds.join("\0") !== next.favoriteServerIds.join("\0")) {
+      await this.reconcileFavorites();
+    }
     if (telemetryAllowed(previous) !== telemetryAllowed(next)) await this.telemetry.setEnabled(telemetryAllowed(next));
     this.telemetry.record((session) => session.updateSettings(sessionSettings(next)));
     if (!previous.automaticServer && next.automaticServer) void this.pingServers();
@@ -668,6 +685,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
       await this.secureStore.put("tunnel_profile", Buffer.from(JSON.stringify(profile)));
       if (serverId) await this.secureStore.put("selected_server", Buffer.from(serverId));
       this.patch({ servers: profile.servers, serverLatencies: {}, selectedServerId: serverId, selectedSubscriptionId: subscriptionId });
+      await this.reconcileFavorites();
       void this.pingServers();
     } finally {
       plaintext.fill(0);
@@ -748,13 +766,22 @@ export class AppController extends EventEmitter<AppControllerEvents> {
       const revision = record.revision;
       this.settingsRevision = typeof revision === "number" && Number.isSafeInteger(revision) && revision >= 0 ? revision : 0;
       this.pendingSync = parsePending(record.pending);
+      this.favoritesJoined = record.favoritesJoined === true;
+      this.favoriteReconciledLocal = new Set(Array.isArray(record.favoriteLocal)
+        ? record.favoriteLocal.filter((id): id is string => typeof id === "string").slice(0, 200)
+        : []);
     } catch {
       await this.secureStore.remove("settings_sync");
     }
   }
 
   private async saveSyncState(): Promise<void> {
-    await this.secureStore.put("settings_sync", Buffer.from(JSON.stringify({ revision: this.settingsRevision, pending: this.pendingSync })));
+    await this.secureStore.put("settings_sync", Buffer.from(JSON.stringify({
+      revision: this.settingsRevision,
+      pending: this.pendingSync,
+      favoritesJoined: this.favoritesJoined,
+      favoriteLocal: [...this.favoriteReconciledLocal],
+    })));
   }
 
   private async recordSyncedChanges(previous: AppSettings, next: AppSettings): Promise<void> {
@@ -762,6 +789,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
       // Turning sync on joins the account's settings; turning it off forgets unsent edits.
       this.settingsRevision = 0;
       this.pendingSync = {};
+      this.favoritesJoined = false;
       await this.saveSyncState();
       this.patch({ settingsSyncedAt: null });
       if (next.syncSettings) void this.syncSettingsNow();
@@ -769,6 +797,8 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     }
     if (!next.syncSettings) return;
     const changes = syncedChanges(previous, next);
+    // Until the first exchange joins them, favourites are not edits of the account's list.
+    if (!this.favoritesJoined) delete changes.favoriteNodes;
     if (!Object.keys(changes).length) return;
     this.pendingSync = { ...this.pendingSync, ...changes };
     await this.saveSyncState();
@@ -800,6 +830,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     }
     if (!document) throw new Error("Сервер вернул некорректные настройки");
     this.pendingSync = withoutConfirmed(this.pendingSync, sent);
+    if (!this.favoritesJoined) await this.joinFavorites(document.settings.favoriteNodes ?? undefined);
     this.settingsRevision = document.revision;
     await this.saveSyncState();
     this.lastSettingsSyncAt = Date.now();
@@ -810,6 +841,55 @@ export class AppController extends EventEmitter<AppControllerEvents> {
       await this.updateSettings(patch, "sync");
     }
     this.patch({ settingsSyncedAt: Date.now() });
+    if (Object.keys(this.pendingSync).length) this.schedulePushIfIdle();
+  }
+
+  /**
+   * The first exchange that includes this computer's favourites keeps those of
+   * both sides; before this computer has a list, the account's becomes its own.
+   */
+  private async joinFavorites(theirs: string | undefined): Promise<void> {
+    const mine = this.state.settings.favoriteNodes;
+    if (mine === null) {
+      if (theirs !== undefined) await this.updateSettings({ favoriteNodes: theirs }, "sync");
+      return;
+    }
+    const joined = theirs === undefined ? mine : unionNodeLists(mine, theirs);
+    if (joined !== mine) await this.updateSettings({ favoriteNodes: joined }, "sync");
+    if (joined !== theirs) this.pendingSync = { ...this.pendingSync, favoriteNodes: joined };
+    this.favoritesJoined = true;
+    await this.saveSyncState();
+  }
+
+  private schedulePushIfIdle(): void {
+    if (this.settingsPushTimer) return;
+    this.settingsPushTimer = setTimeout(() => {
+      this.settingsPushTimer = null;
+      void this.syncSettingsNow();
+    }, SETTINGS_PUSH_DELAY_MS);
+  }
+
+  /** Brings this computer's favourites and the account's node list together (favoriteNodes.ts). */
+  private async reconcileFavorites(): Promise<void> {
+    if (this.reconcilingFavorites || !this.state.servers.length) return;
+    this.reconcilingFavorites = true;
+    try {
+      const settings = this.state.settings;
+      const result = reconcileFavorites(
+        { nodes: parseNodeList(settings.favoriteNodes), reconciledLocal: this.favoriteReconciledLocal },
+        new Set(settings.favoriteServerIds),
+        serversByNode(this.state.servers),
+      );
+      const nodes = canonicalNodeList(result.nodes);
+      const ids = [...result.local];
+      this.favoriteReconciledLocal = result.local;
+      await this.saveSyncState();
+      const sameIds = ids.length === settings.favoriteServerIds.length && settings.favoriteServerIds.every((id) => result.local.has(id));
+      if (nodes === settings.favoriteNodes && sameIds) return;
+      await this.updateSettings({ favoriteServerIds: ids, favoriteNodes: nodes });
+    } finally {
+      this.reconcilingFavorites = false;
+    }
   }
 
   private async loadIdentity(): Promise<DeviceIdentity> {
@@ -877,6 +957,13 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     this.lastTuic = undefined;
     this.settingsRevision = 0;
     this.pendingSync = {};
+    // The next account's list takes over; favourites starred here join it as edits.
+    this.favoritesJoined = false;
+    this.favoriteReconciledLocal = new Set();
+    if (this.state.settings.favoriteNodes !== null) {
+      this.state.settings = { ...this.state.settings, favoriteNodes: null };
+      await this.secureStore.put("settings", Buffer.from(JSON.stringify(serializeSettings(this.state.settings))));
+    }
     if (this.settingsPushTimer) clearTimeout(this.settingsPushTimer);
     this.settingsPushTimer = null;
     await Promise.all([
@@ -1201,6 +1288,7 @@ function validateSettings(value: AppSettings): AppSettings {
     showTrayIcon: Boolean(value.showTrayIcon),
     preventDnsLeaks: Boolean(value.preventDnsLeaks),
     favoriteServerIds: [...new Set(value.favoriteServerIds.filter((id) => /^[a-f0-9]{64}$/.test(id)))].slice(0, 200),
+    favoriteNodes: typeof value.favoriteNodes === "string" && isCanonicalNodeList(value.favoriteNodes) ? value.favoriteNodes : null,
     antiDpiEnabled: Boolean(value.antiDpiEnabled),
     antiDpiPackets: validateAntiDpi(value.antiDpiPackets, "tlshello"),
     antiDpiLength: validateAntiDpi(value.antiDpiLength, "100-200"),

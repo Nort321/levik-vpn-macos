@@ -18,7 +18,7 @@ const settings: AppSettings = {
   closeToTray: true,
   showTrayIcon: true,
   preventDnsLeaks: true,
-  favoriteServerIds: [],
+  favoriteServerIds: [], favoriteNodes: null,
   antiDpiEnabled: false,
   antiDpiPackets: "tlshello",
   antiDpiLength: "100-200",

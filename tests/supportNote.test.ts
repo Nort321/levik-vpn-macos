@@ -82,5 +82,13 @@ describe("support notes", () => {
     expect(text).toContain("Состояние: error — Сервер <ip> не отвечает");
     expect(text).toContain("Сервер: Amsterdam (vless-reality)");
     expect(text).not.toContain("example.com");
+    expect(text).not.toContain("Диагностика");
+
+    const diagnosed = supportReportText(snapshot, {
+      system: "macOS 15.6 (arm64)",
+      now: new Date("2026-10-10T12:00:00Z"),
+      diagnosis: { verdict: "SERVICE_RESTRICTED", text: "YouTube ограничен в России: через VPN он работает.", action: "connect", actionLabel: "Подключить VPN" },
+    });
+    expect(diagnosed).toContain("Диагностика: SERVICE_RESTRICTED — YouTube ограничен в России: через VPN он работает.");
   });
 });

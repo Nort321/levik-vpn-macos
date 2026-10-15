@@ -1,6 +1,6 @@
 import { clipboard, dialog, ipcMain, shell } from "electron";
 import type { BrowserWindow } from "electron";
-import { IPC } from "../shared/contracts";
+import { IPC, isDiagnosisAction } from "../shared/contracts";
 import { isRemoteCommand } from "../shared/remote";
 import type { AppSettings, CabinetTarget } from "../shared/contracts";
 import { AppController } from "./appController";
@@ -78,6 +78,12 @@ export function registerIpc(controller: AppController, window: BrowserWindow): v
     clipboard.writeText(url);
     return url;
   });
+  ipcMain.handle(IPC.diagnose, () => controller.diagnose());
+  ipcMain.handle(IPC.applyDiagnosisAction, async (_event, action: unknown) => {
+    if (!isDiagnosisAction(action)) throw new Error("Некорректное действие");
+    if (action === "networkSettings") await shell.openExternal(NETWORK_SETTINGS_URL);
+    else await controller.applyDiagnosisAction(action);
+  });
   ipcMain.handle(IPC.dismissAnnouncement, (_event, id: unknown) => {
     if (typeof id !== "string") throw new Error("Некорректное сообщение");
     return controller.dismissAnnouncement(id);
@@ -108,6 +114,9 @@ export function registerIpc(controller: AppController, window: BrowserWindow): v
     if (!window.isDestroyed()) window.webContents.send(IPC.snapshotChanged, controller.snapshot());
   });
 }
+
+/** System Settings → Network: a fixed address, never one from the renderer. */
+const NETWORK_SETTINGS_URL = "x-apple.systempreferences:com.apple.Network-Settings.extension";
 
 /** A cabinet page in the browser, signed in when the app can: for the window and the tray. */
 export async function openCabinet(controller: AppController, target: CabinetTarget): Promise<void> {

@@ -76,7 +76,9 @@ import {
 } from "./platform/favoriteNodes";
 import { avoidMaintenance, IdleMeter, maintenanceFor, maintenanceMove } from "./platform/maintenance";
 import {
+  allowedFromFamily,
   createReplyKey,
+  FAMILY_HELP_TEXT,
   openReply,
   parseDeliveredCommands,
   parseIssuedCommands,
@@ -909,12 +911,15 @@ export class AppController extends EventEmitter<AppControllerEvents> {
       const outcome = await this.executeCommand(command);
       await this.withSession((token) => this.api.commandResult(token, command.id, outcome.result, outcome.detail))
         .catch((error: unknown) => this.addLog(`Пульт: ${messageOf(error)}`));
+      const helped = command.fromFamily && outcome.result === "done" ? FAMILY_HELP_TEXT[command.command] : undefined;
+      if (helped) this.emit("notify", { title: "Владелец семьи помог", body: helped, tab: "home" });
     }
   }
 
   private async executeCommand(command: DeliveredCommand): Promise<{ result: "done" | "failed" | "unsupported"; detail: string | null }> {
     // Only the fixed list runs; a disconnect or anything else is refused here too.
     if (!isRemoteCommand(command.command)) return { result: "unsupported", detail: null };
+    if (command.fromFamily && !allowedFromFamily(command.command)) return { result: "unsupported", detail: null };
     this.addLog(`Пульт: ${REMOTE_COMMAND_LABELS[command.command]}`);
     try {
       switch (command.command) {

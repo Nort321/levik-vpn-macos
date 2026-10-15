@@ -189,7 +189,11 @@ function openLink(tab: AppTab): void {
 function showNotice(notice: AppNotice): void {
   if (!Notification.isSupported()) return;
   const notification = new Notification({ title: notice.title, body: notice.body });
-  notification.on("click", () => openLink(notice.tab));
+  notification.on("click", () => {
+    const cabinet = notice.cabinet;
+    if (cabinet && controller) void openCabinet(controller, cabinet).catch(() => openLink(notice.tab));
+    else openLink(notice.tab);
+  });
   notification.show();
 }
 

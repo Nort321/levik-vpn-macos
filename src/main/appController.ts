@@ -28,6 +28,20 @@ import type { PreparedTunnelProfile } from "./vpn/tunnelProfile";
 import { buildXrayConfig } from "./vpn/xrayConfig";
 import { XrayManager } from "./vpn/xrayManager";
 import { measureServerLatencies } from "./vpn/serverPinger";
+import { carriesTraffic, isTunnelHealthy } from "./vpn/tunnelHealth";
+import {
+  nextRung,
+  ProtocolHistoryStore,
+  protocolLabel,
+  rankSmart,
+  recordFailure,
+  recordSuccess,
+  silenceMeansDown,
+  SmartLadder,
+  TunnelFreezeDetector,
+  verdictOf,
+  type RankedServer,
+} from "./vpn/smartAuto";
 import { DnsLeakProtection } from "./macos/protection";
 import { MacKillSwitch } from "./macos/protection";
 import { macHelper } from "./macos/helperClient";
@@ -52,8 +66,8 @@ import type { HomeAction, HomeBeacon, VerifiedHome } from "./platform/levikHome"
 import { expiryNotices, NoticeState } from "./platform/notices";
 import type { AppNotice } from "./platform/notices";
 import {
-  adviceCandidates,
   currentAdvice,
+  currentNodeLoad,
   mergeFetched,
   RemoteConfigClient,
   RemoteConfigStore,
@@ -112,6 +126,8 @@ const HOME_CONNECTED_SCAN_MS = 2 * 60_000;
 const HOME_IDLE_SCAN_MS = 10 * 60_000;
 /** How often a connected app checks whether its server goes into maintenance. */
 const MAINTENANCE_CHECK_MS = 15_000;
+/** Smart Auto waits for the routes to settle before its download. */
+const TRAFFIC_CHECK_DELAY_MS = 1_500;
 /** After the remote list was shown, events keep it current this long. */
 const REMOTE_WATCH_MS = 10 * 60_000;
 const MAX_HANDLED_COMMANDS = 200;
@@ -191,6 +207,13 @@ export class AppController extends EventEmitter<AppControllerEvents> {
   private lastRawDownload = 0;
   private lastRawUpload = 0;
   private pingPromise: Promise<void> | null = null;
+  /** Smart Auto, docs/app-platform.md: which protocols carried traffic on which network. */
+  private readonly protocolHistory = new ProtocolHistoryStore(join(app.getPath("userData"), "smart-auto.json"));
+  private readonly smartLadder = new SmartLadder();
+  private readonly freezeDetector = new TunnelFreezeDetector();
+  /** The running traffic check; a newer one replaces it. */
+  private trafficCheck: symbol | null = null;
+  private climbingLadder = false;
   private resumePromise: Promise<void> | null = null;
   private diagnosisPromise: Promise<DiagnosisSummary> | null = null;
   private lastDiagnosis: { at: number; summary: DiagnosisSummary } | null = null;
@@ -258,6 +281,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     servers: [],
     serverLatencies: {},
     serverMaintenance: {},
+    serverLoad: {},
     remote: { devices: [], commands: [], notes: {}, loadedAt: null },
     selectedServerId: null,
     selectedSubscriptionId: null,
@@ -316,6 +340,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     await this.loadSyncState();
     await this.notices.load();
     this.remoteStored = await this.remoteConfigStore.load();
+    await this.protocolHistory.load();
     this.state.announcements = this.announcements();
     await this.telemetry.setEnabled(telemetryAllowed(this.state.settings)).catch((error: unknown) => {
       this.addLog(`Статистика подключений: ${messageOf(error)}`);
@@ -474,6 +499,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
   async selectServer(serverId: string): Promise<void> {
     const server = this.state.servers.find((item) => item.id === serverId);
     if (!server) throw new Error("Сервер не найден");
+    if (!this.climbingLadder) this.smartLadder.reset();
     const reconnect = this.xray.isRunning();
     if (reconnect) await this.stopTunnelForReplacement();
     try {
@@ -542,6 +568,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
   }
 
   disconnect(): Promise<void> {
+    this.smartLadder.reset();
     return this.stopConnection("user", "user");
   }
 
@@ -1695,6 +1722,11 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     const totalDownload = this.trafficDownloadOffset + downloadBytes;
     const totalUpload = this.trafficUploadOffset + uploadBytes;
     this.idleMeter.record(totalDownload + totalUpload, Date.now());
+    // A tunnel that sends but hardly receives: the same check as after connecting.
+    if (this.state.status === "connected" && this.freezeDetector.record(totalDownload, totalUpload, Date.now())) {
+      this.addLog("Smart Auto: туннель отправляет, но почти не получает данные; проверяем трафик");
+      this.launchTrafficCheck(0);
+    }
     if (totalDownload !== this.state.downloadBytes || totalUpload !== this.state.uploadBytes) {
       this.patch({ downloadBytes: totalDownload, uploadBytes: totalUpload });
     }
@@ -1770,6 +1802,18 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     return this.remoteStored?.config.maintenance ?? [];
   }
 
+  /** Node load by server id for the list. */
+  private serverLoad(now: number): Record<string, number> {
+    const load = currentNodeLoad(this.remoteStored, now);
+    const marked: Record<string, number> = {};
+    for (const server of this.state.servers) {
+      const node = nodeIdForServer(server);
+      const value = node ? load[node] : undefined;
+      if (value !== undefined) marked[server.id] = value;
+    }
+    return marked;
+  }
+
   /** Servers the list marks as under maintenance, with the end of the work. */
   private serverMaintenance(now: number): Record<string, number> {
     const marked: Record<string, number> = {};
@@ -1788,6 +1832,8 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     const now = Date.now();
     const marked = this.serverMaintenance(now);
     if (JSON.stringify(marked) !== JSON.stringify(this.state.serverMaintenance)) this.patch({ serverMaintenance: marked });
+    const load = this.serverLoad(now);
+    if (JSON.stringify(load) !== JSON.stringify(this.state.serverLoad)) this.patch({ serverLoad: load });
     if (this.maintenanceMoving || this.state.busy || this.state.status !== "connected" || !this.xray.isRunning()) return;
     const current = this.selectedServer();
     if (!current) return;
@@ -1851,6 +1897,14 @@ export class AppController extends EventEmitter<AppControllerEvents> {
   }
 
   private bestServer(servers: TunnelServer[]): TunnelServer | null {
+    const eligible = this.automaticCandidates(servers);
+    // Smart Auto: free, fast servers of protocols that carry traffic on this network.
+    const best = this.rankServers(eligible)[0];
+    return eligible.find((item) => item.id === best?.id) ?? null;
+  }
+
+  /** Servers the automatic choice may take. */
+  private automaticCandidates(servers: TunnelServer[]): TunnelServer[] {
     // A home exit («🏠») is only ever the user's own choice.
     const ordinary = servers.filter((item) => !isHomeRoadServer(item.name));
     const offered = ordinary.length ? ordinary : servers;
@@ -1859,20 +1913,93 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     const pool = xrayServers.length ? xrayServers : offered;
     const nonRussian = pool.filter((item) => item.countryCode.toUpperCase() !== "RU");
     // Servers going into maintenance are left out while others remain.
-    const eligible = avoidMaintenance(nonRussian.length ? nonRussian : pool, this.maintenanceWindows(), nodeIdForServer, Date.now());
-    // Protocols that work on the user's operator first, unless none of them answers.
-    const advised = adviceCandidates(eligible, currentAdvice(this.remoteStored, Date.now()), protocolOf);
-    const measured = (items: TunnelServer[]) => items.some((item) => this.state.serverLatencies[item.id] != null);
-    const candidates = measured(advised) || !measured(eligible) ? advised : eligible;
-    return candidates.reduce<TunnelServer | null>((best, candidate) => {
-      if (!best) return candidate;
-      const bestLatency = this.state.serverLatencies[best.id];
-      const candidateLatency = this.state.serverLatencies[candidate.id];
-      if (candidateLatency !== null && candidateLatency !== undefined && (bestLatency === null || bestLatency === undefined || candidateLatency < bestLatency)) {
-        return candidate;
+    return avoidMaintenance(nonRussian.length ? nonRussian : pool, this.maintenanceWindows(), nodeIdForServer, Date.now());
+  }
+
+  /** Best first, docs/app-platform.md "Smart Auto". */
+  private rankServers(servers: readonly TunnelServer[]): RankedServer[] {
+    const now = Date.now();
+    const load = currentNodeLoad(this.remoteStored, now);
+    const history = this.protocolHistory.current();
+    const network = this.protocolHistory.networkKey();
+    return rankSmart(servers.map((server) => {
+      const protocol = protocolOf(server);
+      const node = nodeIdForServer(server);
+      return {
+        id: server.id,
+        protocol,
+        latencyMs: this.state.serverLatencies[server.id] ?? null,
+        silenceMeansDown: silenceMeansDown(server.outbound),
+        load: node ? load[node] ?? null : null,
+        verdict: verdictOf(history, network, protocol, now),
+      };
+    }), currentAdvice(this.remoteStored, now));
+  }
+
+  /** After an automatic connection: does the tunnel carry a real download? */
+  private startTrafficCheck(delayMs = TRAFFIC_CHECK_DELAY_MS): void {
+    this.freezeDetector.reset();
+    this.trafficCheck = null;
+    this.launchTrafficCheck(delayMs);
+  }
+
+  private launchTrafficCheck(delayMs: number): void {
+    const server = this.selectedServer();
+    if (!server || !this.state.settings.automaticServer || this.trafficCheck || isHomeRoadServer(server.name)) return;
+    const current = (): boolean => this.xray.isRunning()
+      && this.state.status === "connected" && this.state.selectedServerId === server.id;
+    const check = Symbol("traffic-check");
+    this.trafficCheck = check;
+    void (async () => {
+      await delay(delayMs);
+      if (!current()) return;
+      const passed = await carriesTraffic(current);
+      if (!current()) return;
+      const network = this.protocolHistory.networkKey();
+      const protocol = protocolOf(server);
+      if (passed) {
+        this.smartLadder.reset();
+        if (network) await this.protocolHistory.update((history) => recordSuccess(history, network, protocol, Date.now(), server.id));
+        return;
       }
-      return best;
-    }, null);
+      // No handshake either: the tunnel is down, which the health check handles.
+      // A handshake without a download is a throttled protocol.
+      if (!await isTunnelHealthy() || !current()) return;
+      if (network) {
+        const node = nodeIdForServer(server) ?? server.id;
+        await this.protocolHistory.update((history) => recordFailure(history, network, protocol, node, Date.now(), server.id));
+      }
+      this.addLog(`Smart Auto: ${protocolLabel(protocol)} не передаёт трафик через ${server.name}`);
+      // The next server gets its own check once it connects.
+      if (this.trafficCheck === check) this.trafficCheck = null;
+      await this.climbProtocolLadder(server, protocol);
+    })().catch((error: unknown) => this.addLog(`Smart Auto: ${messageOf(error)}`))
+      .finally(() => { if (this.trafficCheck === check) this.trafficCheck = null; });
+  }
+
+  /** The next rung: the best server of a protocol not tried yet, a few moves at most. */
+  private async climbProtocolLadder(failed: TunnelServer, protocol: string): Promise<void> {
+    this.smartLadder.tried(failed.id, protocol);
+    if (this.smartLadder.exhausted()) {
+      this.addLog("Smart Auto: проверены несколько протоколов, остаёмся на текущем сервере");
+      return;
+    }
+    const candidates = this.automaticCandidates(this.state.servers);
+    const next = nextRung(this.rankServers(candidates), this.smartLadder.triedProtocols(), this.smartLadder.triedIds());
+    if (!next || next.id === failed.id) return;
+    this.smartLadder.climbed();
+    this.nextAttemptCause = "failover";
+    this.climbingLadder = true;
+    try {
+      await this.selectServer(next.id);
+    } finally {
+      this.climbingLadder = false;
+    }
+    if (next.protocol !== protocol && this.state.status === "connected" && this.state.selectedServerId === next.id) {
+      const notice = `${protocolLabel(protocol)} не работает в этой сети. Переключились на ${protocolLabel(next.protocol)}`;
+      this.addLog(`Smart Auto: ${notice}`);
+      this.patch({ statusDetail: notice });
+    }
   }
 
   private requireToken(): string {
@@ -1924,6 +2051,8 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     this.telemetry.record((session) => session.connected());
     // Reports leave through the working tunnel, after it has settled.
     this.telemetry.flushSoon();
+    // A new network or server may not carry what worked before.
+    this.startTrafficCheck();
   }
 
   private addLog(line: string): void {

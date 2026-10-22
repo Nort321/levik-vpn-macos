@@ -3,6 +3,7 @@ import type { TunnelProfileEnvelope } from "../api/models";
 import { decodeBase64Url } from "../../shared/base64";
 import type { TunnelServer } from "../../shared/contracts";
 import { DeviceIdentity } from "../security/deviceIdentity";
+import { extractServerEndpoint } from "./serverPinger";
 
 export interface PreparedTunnelProfile {
   profileId: string;
@@ -59,7 +60,11 @@ export function prepareTunnelProfile(plaintext: Uint8Array, expectedSubscription
   if (raw.version !== 1 || raw.subscriptionId !== expectedSubscriptionId) throw new Error("Профиль не соответствует подписке");
   if (!/^[A-Za-z0-9._:-]{1,128}$/.test(raw.profileId)) throw new Error("Некорректный идентификатор профиля");
   if (!raw.source || typeof raw.source.content !== "string") throw new Error("Профиль не содержит конфигурацию");
-  const servers = parseSource(raw.source.content);
+  const parsed = parseSource(raw.source.content);
+  // Remnawave's stub links (expired, traffic used up, no ordinary servers…) are never servers.
+  const servers = parsed.filter((server) => !isSubscriptionPlaceholder(server));
+  const placeholder = parsed.find(isSubscriptionPlaceholder);
+  if (servers.length === 0 && placeholder) throw new Error(placeholderMessage(placeholder.name));
   if (servers.length === 0 || servers.length > 200) throw new Error("В профиле нет совместимых серверов");
   return {
     profileId: raw.profileId,
@@ -70,6 +75,19 @@ export function prepareTunnelProfile(plaintext: Uint8Array, expectedSubscription
     directDomains: validateDomains(raw.routing?.directDomains ?? []),
     proxyDomains: validateDomains(raw.routing?.proxyDomains ?? []),
   };
+}
+
+/** Remnawave's stub link: VLESS to 0.0.0.0:1 named after the reason. */
+export function isSubscriptionPlaceholder(server: TunnelServer): boolean {
+  const endpoint = extractServerEndpoint(server.outbound);
+  return server.outbound.protocol === "vless" && endpoint?.host === "0.0.0.0" && endpoint.port === 1;
+}
+
+/** The stub's name is the panel's explanation, e.g. "Подписка закончилась · продлите в боте". */
+function placeholderMessage(name: string): string {
+  return /недоступн/i.test(name)
+    ? "В подписке сейчас нет серверов обычного VPN. Обновите подписку или напишите в поддержку."
+    : name;
 }
 
 function parseSource(source: string): TunnelServer[] {

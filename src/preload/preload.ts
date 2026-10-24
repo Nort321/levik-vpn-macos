@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from "electron";
+import { contextBridge, ipcRenderer, webUtils } from "electron";
 import { IPC } from "../shared/contracts";
 import type { AppSettings, AppSnapshot, AppTab, DiagnosisSummary, LevikDesktopApi } from "../shared/contracts";
 
@@ -33,6 +33,14 @@ const api: LevikDesktopApi = {
   sendRemoteCommand: (deviceId, command) => ipcRenderer.invoke(IPC.sendRemoteCommand, deviceId, command),
   openRemoteNote: (commandId) => ipcRenderer.invoke(IPC.openRemoteNote, commandId),
   setHomeRoad: (enabled) => ipcRenderer.invoke(IPC.setHomeRoad, enabled),
+  refreshDrop: () => ipcRenderer.invoke(IPC.refreshDrop),
+  sendDropFiles: (deviceId, paths) => ipcRenderer.invoke(IPC.sendDropFiles, deviceId, paths),
+  // Paths only exist for files from the system (Finder); the main process checks each one.
+  dropFilePaths: (files) => files.map((file) => webUtils.getPathForFile(file)).filter((path) => path !== ""),
+  answerDrop: (transferId, answer, code) => ipcRenderer.invoke(IPC.answerDrop, transferId, answer, code),
+  controlDrop: (transferId, action) => ipcRenderer.invoke(IPC.controlDrop, transferId, action),
+  chooseDropFolder: () => ipcRenderer.invoke(IPC.chooseDropFolder),
+  showDropFiles: (transferId) => ipcRenderer.invoke(IPC.showDropFiles, transferId),
   onSnapshot(listener) {
     const wrapped = (_event: Electron.IpcRendererEvent, snapshot: AppSnapshot) => listener(snapshot);
     ipcRenderer.on(IPC.snapshotChanged, wrapped);

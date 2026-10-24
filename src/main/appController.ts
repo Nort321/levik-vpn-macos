@@ -18,6 +18,10 @@ import type {
   TuicEndpoint,
 } from "../shared/contracts";
 import { isAuthenticationRejected, MobileApiClient, MobileApiError } from "./api/mobileApiClient";
+import { DropEngine } from "./platform/levikDrop/engine";
+import type { DropApi } from "./platform/levikDrop/engine";
+import { markDownloaded } from "./macos/downloadMark";
+import type { DropAnswer, DropControl } from "../shared/drop";
 import type { AuthChallengeResponse, MobileAccountResponse, RoadExitResponse } from "./api/models";
 import { DeviceIdentity } from "./security/deviceIdentity";
 import type { SerializedIdentity } from "./security/deviceIdentity";
@@ -260,6 +264,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
   private remoteWatchedUntil = 0;
   private readonly idleMeter = new IdleMeter();
   private liveEvents: LiveEvents | null = null;
+  private drop: DropEngine | null = null;
   /** What the server holds for this computer; null when it holds nothing. */
   private sentPresence: PresenceReport | null = null;
   private sentPresenceAt = 0;
@@ -284,6 +289,10 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     serverMaintenance: {},
     serverLoad: {},
     remote: { devices: [], commands: [], notes: {}, loadedAt: null },
+    drop: {
+      available: false, loadedAt: null, devices: [], transfers: [], quota: null,
+      limits: { maxFiles: 20, maxBytes: 2 * 1024 ** 3 }, folder: app.getPath("downloads"), error: null,
+    },
     selectedServerId: null,
     selectedSubscriptionId: null,
     settings: DEFAULT_SETTINGS,
@@ -333,6 +342,20 @@ export class AppController extends EventEmitter<AppControllerEvents> {
       isAuthenticationRejected,
     );
     this.liveEvents.on("event", (event) => this.handleLiveEvent(event));
+    this.drop = new DropEngine({
+      api: this.dropApi(),
+      secrets: this.secureStore,
+      statePath: join(app.getPath("userData"), "levikdrop", "state.json"),
+      platform: "macos",
+      defaultFolder: app.getPath("downloads"),
+      markDownloaded,
+      errorCode: (error) => error instanceof MobileApiError ? error.code ?? (error.status ? `http_${error.status}` : null) : null,
+      log: (line) => this.addLog(line),
+    });
+    this.drop.on("changed", () => {
+      if (this.drop) this.patch({ drop: this.drop.snapshot() });
+    });
+    this.drop.on("notify", (notice) => this.emit("notify", { ...notice, tab: "profile" }));
     // The stream does not clear the session itself; a regular request decides.
     this.liveEvents.on("unauthorized", () => void this.checkAccount(true));
     this.accessToken = await this.loadString("access_token");
@@ -639,7 +662,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     this.maintenanceTimer = null;
     this.stopPresence();
     this.liveEvents?.stop();
-    await Promise.race([this.withdrawPresence(), delay(2_000)]);
+    await Promise.race([Promise.all([this.withdrawPresence(), this.drop?.stop()]), delay(2_000)]);
     // Unsent setting changes are kept on disk and sent after the next start.
     if (this.settingsPushTimer) clearTimeout(this.settingsPushTimer);
     this.settingsPushTimer = null;
@@ -1070,7 +1093,10 @@ export class AppController extends EventEmitter<AppControllerEvents> {
   }
 
   private startLiveEvents(): void {
-    if (this.accessToken) this.liveEvents?.start();
+    if (!this.accessToken) return;
+    this.liveEvents?.start();
+    // Signed in: this computer can receive files (docs/levik-drop.md "Platforms").
+    void this.drop?.start();
   }
 
   /** docs/app-platform.md "Live events": every event names what to fetch again. */
@@ -1087,6 +1113,10 @@ export class AppController extends EventEmitter<AppControllerEvents> {
         void this.checkAccount();
         this.reportPresenceSoon(true);
         this.refreshHomeRoadSoon();
+        this.drop?.refresh();
+        break;
+      case "drop":
+        this.drop?.refresh();
         break;
       case "settings":
         void this.syncSettingsNow();
@@ -1096,6 +1126,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
         break;
       case "devices":
         void this.checkAccount(true);
+        this.drop?.refresh();
         this.refreshRemoteIfWatched();
         this.refreshHomeRoadSoon();
         break;
@@ -1139,6 +1170,48 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     } catch (error) {
       this.addLog(`Правила аккаунта: ${messageOf(error)}`);
     }
+  }
+
+  // LevikDrop, docs/levik-drop.md ------------------------------------------------------
+
+  async refreshDrop(): Promise<void> {
+    await this.drop?.refreshNow();
+  }
+
+  async sendDropFiles(deviceId: string, paths: readonly string[]): Promise<void> {
+    if (!this.drop) throw new Error("Передача файлов ещё не готова");
+    await this.drop.send(deviceId, paths);
+  }
+
+  async answerDrop(transferId: string, answer: DropAnswer, code: string | null): Promise<void> {
+    await this.drop?.answer(transferId, answer, code);
+  }
+
+  async controlDrop(transferId: string, action: DropControl): Promise<void> {
+    await this.drop?.control(transferId, action);
+  }
+
+  setDropFolder(folder: string): void {
+    if (this.drop) this.drop.folder = folder;
+  }
+
+  dropSavedFile(transferId: string): string | null {
+    return this.drop?.savedFile(transferId) ?? null;
+  }
+
+  /** The website's LevikDrop routes for this session; withSession clears an expired one. */
+  private dropApi(): DropApi {
+    return {
+      presence: (key) => this.withSession((token) => this.api.dropPresence(token, key)),
+      clearPresence: async () => {
+        const token = this.accessToken;
+        if (token) await this.api.clearDropPresence(token);
+      },
+      devices: () => this.withSession((token) => this.api.dropDevices(token)),
+      transfers: () => this.withSession((token) => this.api.dropTransfers(token)),
+      create: (offer) => this.withSession((token) => this.api.createDropTransfer(token, offer)),
+      update: (step) => this.withSession((token) => this.api.updateDropTransfer(token, step)),
+    };
   }
 
   /** The account's apps for the remote; events keep the list current for a while. */
@@ -1614,6 +1687,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
   }
 
   private async clearLocalSession(statusDetail: string | null): Promise<void> {
+    await this.drop?.signedOut();
     this.liveEvents?.stop();
     this.homeRoadAvailable = false;
     this.lastHomeRoadAt = 0;

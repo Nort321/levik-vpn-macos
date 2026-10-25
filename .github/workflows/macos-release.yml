@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the release to users (otherwise it stays a draft)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -115,6 +120,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ needs.build.outputs.version }}
           COMMIT_SHA: ${{ github.sha }}
+          PUBLISH: ${{ github.event_name == 'workflow_dispatch' && inputs.publish }}
         run: |
           set -euo pipefail
           tag="v$VERSION"
@@ -124,7 +130,10 @@ jobs:
           if gh release view "$tag" >/dev/null 2>&1; then
             test "$(gh release view "$tag" --json isDraft --jq .isDraft)" = true || { echo 'Refusing to overwrite a published release'; exit 1; }
             gh release upload "$tag" release/* --clobber
-            gh release edit "$tag" --notes-file "$notes" --draft=false
+            gh release edit "$tag" --notes-file "$notes"
           else
-            gh release create "$tag" release/* --target "$COMMIT_SHA" --title "Levik VPN для macOS $VERSION" --notes-file "$notes"
+            gh release create "$tag" release/* --target "$COMMIT_SHA" --title "Levik VPN для macOS $VERSION" --notes-file "$notes" --draft
+          fi
+          if [ "$PUBLISH" = "true" ]; then
+            gh release edit "$tag" --draft=false --prerelease=false --latest
           fi

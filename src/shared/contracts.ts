@@ -1,3 +1,4 @@
+import type { ServiceRouteStatus } from "./serviceRoutes";
 import type { RemoteCommand, RemoteSnapshot } from "./remote";
 
 export type AppTab = "home" | "servers" | "stats" | "profile";
@@ -133,6 +134,9 @@ export interface AppSettings {
 }
 
 export interface AppSnapshot {
+  serviceRoutes?: ServiceRouteStatus | null;
+  serviceRouteNotice?: string | null;
+  serviceRouteDetails?: Array<{ label: string; state: "active" | "fallback" | "blocked" | "unavailable"; exitName: string }>;
   appVersion: string;
   tab: AppTab;
   status: ConnectionStatus;

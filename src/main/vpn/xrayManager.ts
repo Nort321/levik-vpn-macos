@@ -1,3 +1,5 @@
+import { ServiceRouteSession } from "./serviceRouteSession";
+import type { ServiceRouteStatus } from "./serviceRoutes";
 import { app } from "electron";
 import { macHelper } from "../macos/helperClient";
 import { join } from "node:path";
@@ -7,6 +9,7 @@ import { isTunnelHealthy } from "./tunnelHealth";
 import type { TuicEndpoint } from "../../shared/contracts";
 
 interface XrayEvents {
+  serviceRoutes: [status: ServiceRouteStatus];
   log: [line: string];
   exit: [code: number | null, expected: boolean];
   stats: [downloadBytes: number, uploadBytes: number];
@@ -17,6 +20,7 @@ interface XrayEvents {
 }
 
 export class XrayManager extends EventEmitter<XrayEvents> {
+  readonly serviceRoutes = new ServiceRouteSession((status) => this.emit("serviceRoutes", status));
   private running = false;
   private stopping = false;
   private statsTimer: ReturnType<typeof setInterval> | null = null;
@@ -31,6 +35,7 @@ export class XrayManager extends EventEmitter<XrayEvents> {
 
   async start(config: Record<string, unknown>, tuic?: TuicEndpoint): Promise<void> {
     this.stopping = true;
+    this.serviceRoutes.stop();
     this.stopStatsPolling();
     this.running = false;
     await macHelper.request("start", {
@@ -43,10 +48,13 @@ export class XrayManager extends EventEmitter<XrayEvents> {
     });
     this.running = true;
     this.stopping = false;
+    try { await this.serviceRoutes.start(config); }
+    catch (error) { await this.stop(); throw error; }
     this.startStatsPolling();
   }
 
   async stop(): Promise<void> {
+    this.serviceRoutes.stop();
     this.stopping = true;
     this.stopStatsPolling();
     if (macHelper.connected) await macHelper.request("stop");
@@ -61,8 +69,9 @@ export class XrayManager extends EventEmitter<XrayEvents> {
     if (!this.running) return false;
     const generation = this.statsGeneration;
     try {
-      await this.statsClient.query("inbound>>>levik-tun-in>>>");
-      const healthy = await isTunnelHealthy({ onFailure });
+      if (this.serviceRoutes.active) await this.serviceRoutes.queryStats();
+      else await this.statsClient.query("inbound>>>levik-tun-in>>>");
+      const healthy = this.serviceRoutes.active || await isTunnelHealthy({ onFailure });
       return healthy && this.running && generation === this.statsGeneration;
     } catch {
       // The core's stats API is not answering, so it is not serving traffic.
@@ -103,6 +112,7 @@ export class XrayManager extends EventEmitter<XrayEvents> {
    */
   setSuspended(suspended: boolean): void {
     this.suspended = suspended;
+    this.serviceRoutes.setSuspended(suspended);
     this.healthFailures = 0;
   }
 
@@ -120,6 +130,7 @@ export class XrayManager extends EventEmitter<XrayEvents> {
       this.emit("unhealthy");
       this.emit("log", "VPN перестал передавать трафик. Восстановление соединения…");
       this.running = false;
+      this.serviceRoutes.stop();
       this.stopStatsPolling();
       this.emit("exit", null, false);
     } finally {
@@ -132,7 +143,8 @@ export class XrayManager extends EventEmitter<XrayEvents> {
     this.statsQueryRunning = true;
     const generation = this.statsGeneration;
     try {
-      const values = await this.statsClient.query("inbound>>>levik-tun-in>>>traffic>>>");
+      const values = this.serviceRoutes.active ? await this.serviceRoutes.queryStats()
+        : await this.statsClient.query("inbound>>>levik-tun-in>>>traffic>>>");
       if (generation !== this.statsGeneration) return;
       this.statsErrorReported = false;
       if (this.running) this.emit("stats", values.downlink, values.uplink);

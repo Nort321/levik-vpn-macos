@@ -1,3 +1,4 @@
+import { withServiceRoutes } from "./serviceRoutes";
 import type { AppSettings, TunnelServer } from "../../shared/contracts";
 import type { PreparedTunnelProfile } from "./tunnelProfile";
 import { XRAY_STATS_ENDPOINT } from "./xrayStats";
@@ -38,6 +39,9 @@ export function buildXrayConfig(
   const proxyDomains = [...profile.proxyDomains];
   if (settings.routingMode === "blockedOnly") proxyDomains.push(...BLOCKED_DOMAINS);
 
+  const includedAppRule: Record<string, unknown> | undefined = settings.splitTunnelMode === "only" && settings.splitTunnelProcesses.length
+    ? { type: "field", process: settings.splitTunnelProcesses, outboundTag: server.tag } : undefined;
+
   const rules: Record<string, unknown>[] = [
     { type: "field", inboundTag: ["levik-tun-in"], port: "53", outboundTag: "levik-dns-out" },
     { type: "field", inboundTag: ["levik-dns"], outboundTag: server.tag },
@@ -45,9 +49,7 @@ export function buildXrayConfig(
     ...(settings.splitTunnelMode === "bypass" && settings.splitTunnelProcesses.length
       ? [{ type: "field", process: settings.splitTunnelProcesses, outboundTag: "levik-direct" }]
       : []),
-    ...(settings.splitTunnelMode === "only" && settings.splitTunnelProcesses.length
-      ? [{ type: "field", process: settings.splitTunnelProcesses, outboundTag: server.tag }]
-      : []),
+    ...(includedAppRule ? [includedAppRule] : []),
     ...(proxyDomains.length ? [{ type: "field", domain: unique(proxyDomains), outboundTag: server.tag }] : []),
     ...(profile.directCidrs.length ? [{ type: "field", ip: profile.directCidrs, outboundTag: "levik-direct" }] : []),
     ...(directDomains.length ? [{ type: "field", domain: unique(directDomains), outboundTag: "levik-direct" }] : []),
@@ -60,7 +62,7 @@ export function buildXrayConfig(
     rules.push({ type: "field", network: "tcp,udp", outboundTag: "levik-direct" });
   }
 
-  return {
+  return withServiceRoutes({
     log: { loglevel: "warning" },
     api: { tag: "levik-api", listen: XRAY_STATS_ENDPOINT, services: ["StatsService"] },
     dns: {
@@ -94,7 +96,11 @@ export function buildXrayConfig(
     routing: { domainStrategy: "IPIfNonMatch", domainMatcher: "hybrid", rules },
     policy: { system: { statsInboundDownlink: true, statsInboundUplink: true, statsOutboundDownlink: true, statsOutboundUplink: true } },
     stats: {},
-  };
+  }, { policy: profile.serviceRoutes, selected: server, servers: profile.servers,
+    automaticServer: settings.automaticServer,
+    applicationFilterUnsupported: settings.splitTunnelMode !== "off" && settings.splitTunnelProcesses.length > 0,
+    ...(settings.splitTunnelMode === "only" ? { onlyProcesses: settings.splitTunnelProcesses, insertionIndex: includedAppRule ? rules.indexOf(includedAppRule) : rules.length } : {}), bootstrapEndpoints: false, directTag: "levik-direct",
+    prepareOutbound: (candidate) => withAlternateXhttpMux(withAntiDpi(candidate, settings)) });
 }
 
 /**

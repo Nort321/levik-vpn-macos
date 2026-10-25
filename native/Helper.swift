@@ -225,7 +225,14 @@ func isDNSHTTPSAddress(_ value: String) -> Bool {
     return url.port.map { (1...65535).contains($0) } ?? true
 }
 
-func inspectJSON(_ value: Any, depth: Int = 0, path: [String] = []) throws {
+func isServiceDNSTCPAddress(_ value: String) -> Bool {
+    guard value.utf8.count <= 512, let url = URLComponents(string: value), url.scheme == "tcp",
+          let host = url.host, isIP(host), url.user == nil, url.password == nil, url.fragment == nil,
+          url.path.isEmpty else { return false }
+    return url.port.map { (1...65535).contains($0) } ?? true
+}
+
+func inspectJSON(_ value: Any, depth: Int = 0, path: [String] = [], allowServiceDNS: Bool = false) throws {
     try require(depth < 40, "Конфигурация слишком сложная")
     if let object = value as? [String: Any] {
         for (key, item) in object {
@@ -234,29 +241,54 @@ func inspectJSON(_ value: Any, depth: Int = 0, path: [String] = []) throws {
             if ["address", "listen", "redirect"].contains(lowered), let text = item as? String {
                 // Xray DNS server addresses may be HTTPS URLs. This exception
                 // must not permit URL/file/socket paths in outbound addresses.
-                let isDNSURL = path == ["dns", "servers", "*"] && key == "address" && isDNSHTTPSAddress(text)
+                let isDNSURL = path == ["dns", "servers", "*"] && key == "address" && (isDNSHTTPSAddress(text) || allowServiceDNS && isServiceDNSTCPAddress(text))
                 try require(isDNSURL || (!text.contains("/") && !text.contains("\\") && text.utf8.count <= 512), "Некорректный сетевой адрес")
             }
-            try inspectJSON(item, depth: depth + 1, path: path + [key])
+            try inspectJSON(item, depth: depth + 1, path: path + [key], allowServiceDNS: allowServiceDNS)
         }
     } else if let array = value as? [Any] {
         try require(array.count <= 10000, "Слишком много параметров ядра")
-        for item in array { try inspectJSON(item, depth: depth + 1, path: path + ["*"]) }
+        for item in array { try inspectJSON(item, depth: depth + 1, path: path + ["*"], allowServiceDNS: allowServiceDNS) }
     } else if let text = value as? String {
         try require(!text.hasPrefix("ext:") && !text.contains("\0"), "Внешние файлы конфигурации запрещены")
     }
 }
 
+func hasServiceRoutes(_ config: [String: Any]) -> Bool {
+    let routing = config["routing"] as? [String: Any]
+    let balancers = routing?["balancers"] as? [[String: Any]] ?? []
+    return balancers.contains { $0["tag"] as? String == "levik-service-main" }
+}
+
 func validateConfig(_ config: [String: Any]) throws {
-    try inspectJSON(config)
+    try inspectJSON(config, allowServiceDNS: hasServiceRoutes(config))
     let allowed: Set<String> = ["log", "api", "dns", "inbounds", "outbounds", "routing", "policy", "stats"]
     try require(Set(config.keys).isSubset(of: allowed), "Неподдерживаемая конфигурация ядра")
-    guard let inbound = config["inbounds"] as? [[String: Any]], inbound.count == 1,
+    let serviceRoutes = hasServiceRoutes(config)
+    guard let inbound = config["inbounds"] as? [[String: Any]], !inbound.isEmpty,
+          (serviceRoutes ? inbound.count <= 34 : inbound.count == 1),
           inbound[0]["protocol"] as? String == "tun", inbound[0]["tag"] as? String == "levik-tun-in",
-          let outbounds = config["outbounds"] as? [[String: Any]], !outbounds.isEmpty, outbounds.count <= 12 else {
+          let outbounds = config["outbounds"] as? [[String: Any]], !outbounds.isEmpty, outbounds.count <= (serviceRoutes ? 48 : 12) else {
         throw HelperError("Некорректный VPN-профиль")
     }
-    let protocols: Set<String> = ["vless", "vmess", "trojan", "shadowsocks", "socks", "http", "hysteria", "freedom", "blackhole", "dns"]
+    if serviceRoutes {
+        var ports = Set<Int>()
+        for probe in inbound.dropFirst() {
+            guard let tag = probe["tag"] as? String,
+                  probe["protocol"] as? String == "http", probe["listen"] as? String == "127.0.0.1",
+                  let port = probe["port"] as? Int, ports.insert(port).inserted,
+                  (tag == "levik-service-api-in" && port == 47187) ||
+                    (tag.range(of: "^levik-service-endpoint-[0-9]{1,2}-probe$", options: .regularExpression) != nil && (47200...47231).contains(port)),
+                  let settings = probe["settings"] as? [String: Any], let accounts = settings["accounts"] as? [[String: Any]], accounts.count == 1,
+                  accounts[0]["user"] as? String == "levik-service", let password = accounts[0]["pass"] as? String,
+                  password.range(of: "^[0-9a-f]{48}$", options: .regularExpression) != nil,
+                  Set(probe.keys).isSubset(of: ["tag", "protocol", "listen", "port", "settings"]) else {
+                throw HelperError("Некорректный локальный маршрут")
+            }
+        }
+    }
+    var protocols: Set<String> = ["vless", "vmess", "trojan", "shadowsocks", "socks", "http", "hysteria", "freedom", "blackhole", "dns"]
+    if serviceRoutes { protocols.insert("loopback") }
     for outbound in outbounds {
         try require(protocols.contains(outbound["protocol"] as? String ?? ""), "Протокол не поддерживается")
     }
@@ -554,10 +586,16 @@ final class TunnelSession {
         guard let number = (30..<240).first(where: { if_nametoindex("utun\($0)") == 0 }) else { throw HelperError("Нет свободного VPN-интерфейса") }
         interface = "utun\(number)"
         config["log"] = ["access": "none", "error": "", "loglevel": "info"]
-        config["api"] = ["tag": "levik-api", "listen": "127.0.0.1:47185", "services": ["StatsService"]]
+        let serviceRoutes = hasServiceRoutes(supplied)
+        config["api"] = serviceRoutes ? ["tag": "levik-api", "services": ["StatsService", "RoutingService"]]
+            : ["tag": "levik-api", "listen": "127.0.0.1:47185", "services": ["StatsService"]]
         config["inbounds"] = [["tag": "levik-tun-in", "protocol": "tun", "settings": ["name": interface!, "mtu": 1500, "gateway": ["10.89.0.1/30"], "autoSystemRoutingTable": ["0.0.0.0/0", "::/0"], "autoOutboundsInterface": outboundInterface], "sniffing": ["enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true]]]
         var inbounds = config["inbounds"] as! [[String: Any]]
-        inbounds.append(["tag": "levik-connectivity", "listen": "127.0.0.1", "port": 47186, "protocol": "http", "settings": ["allowTransparent": false]])
+        if serviceRoutes, let suppliedInbounds = supplied["inbounds"] as? [[String: Any]] {
+            // Only validated, loopback-only service probes survive IPC; utun stays helper-owned.
+            inbounds.append(contentsOf: suppliedInbounds.dropFirst())
+        }
+        if !serviceRoutes { inbounds.append(["tag": "levik-connectivity", "listen": "127.0.0.1", "port": 47186, "protocol": "http", "settings": ["allowTransparent": false]]) }
         config["inbounds"] = inbounds
         var dnsConfig = config["dns"] as? [String: Any] ?? [:]
         var hosts = dnsConfig["hosts"] as? [String: Any] ?? [:]
@@ -578,7 +616,8 @@ final class TunnelSession {
         config["dns"] = dnsConfig
         config["outbounds"] = outbounds
         guard let selectedTag = outbounds.first?["tag"] as? String,
-              !["freedom", "blackhole", "dns"].contains(outbounds.first?["protocol"] as? String ?? "") else { throw HelperError("Не выбран VPN-сервер") }
+              !["freedom", "blackhole", "dns"].contains(outbounds.first?["protocol"] as? String ?? ""),
+              outbounds.first?["protocol"] as? String != "loopback" || serviceRoutes else { throw HelperError("Не выбран VPN-сервер") }
         var routing = config["routing"] as? [String: Any] ?? [:]
         var rules = routing["rules"] as? [[String: Any]] ?? []
         rules.insert(["type": "field", "inboundTag": ["levik-connectivity"], "outboundTag": selectedTag], at: 0)
@@ -611,9 +650,11 @@ final class TunnelSession {
         let deadline = Date().addingTimeInterval(12)
         while Date() < deadline && process.isRunning {
             if if_nametoindex(interface!) != 0,
-               let health = try? run(coreURL.path, ["api", "statsquery", "--server=127.0.0.1:47185", "-pattern", "inbound>>>levik-tun-in>>>"], timeout: 2), health.0 == 0 {
-                do { try verifyConnectivity() }
-                catch { try stop(); throw error }
+               serviceRoutes || ((try? run(coreURL.path, ["api", "statsquery", "--server=127.0.0.1:47185", "-pattern", "inbound>>>levik-tun-in>>>"], timeout: 2).0) == 0) {
+                if !serviceRoutes {
+                    do { try verifyConnectivity() }
+                    catch { try stop(); throw error }
+                }
                 if dns { try applyDNS() }
                 sidecarCommitted = true
                 return

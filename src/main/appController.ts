@@ -35,19 +35,26 @@ import type { PreparedTunnelProfile } from "./vpn/tunnelProfile";
 import { buildXrayConfig } from "./vpn/xrayConfig";
 import { XrayManager } from "./vpn/xrayManager";
 import { measureServerLatencies, extractServerEndpoint } from "./vpn/serverPinger";
-import { carriesTraffic, isTunnelHealthy } from "./vpn/tunnelHealth";
+import { FAILED_TRAFFIC_CHECK_MS, isTunnelHealthy, measureTraffic } from "./vpn/tunnelHealth";
 import {
+  agedLoad,
+  LOAD_FORGET_MS,
   nextRung,
+  overloadMoveDue,
   ProtocolHistoryStore,
   protocolLabel,
   rankSmart,
+  smartScore,
+  spreadSeed,
   recordFailure,
   recordSuccess,
   silenceMeansDown,
   SmartLadder,
   TunnelFreezeDetector,
   verdictOf,
+  type ProtocolHistory,
   type RankedServer,
+  type SmartCandidate,
 } from "./vpn/smartAuto";
 import { DnsLeakProtection } from "./macos/protection";
 import { MacKillSwitch } from "./macos/protection";
@@ -75,13 +82,20 @@ import type { AppNotice } from "./platform/notices";
 import {
   flagEnabled,
   currentAdvice,
-  currentNodeLoad,
   mergeFetched,
   RemoteConfigClient,
   RemoteConfigStore,
   visibleAnnouncements,
 } from "./platform/remoteConfig";
 import type { StoredRemoteConfig } from "./platform/remoteConfig";
+import {
+  currentQuality,
+  LIVE_LOAD_CONNECTED_EVERY_MS,
+  LIVE_LOAD_MAX_AGE_MS,
+  LiveLoadClient,
+  mergeLiveLoad,
+  type LiveLoad,
+} from "./platform/liveLoad";
 import {
   parsePending,
   parseSettingsDocument,
@@ -136,6 +150,8 @@ const HOME_CONNECTED_SCAN_MS = 2 * 60_000;
 const HOME_IDLE_SCAN_MS = 10 * 60_000;
 /** How often a connected app checks whether its server goes into maintenance. */
 const MAINTENANCE_CHECK_MS = 15_000;
+/** While the current node is full, its load is asked for this often to confirm it. */
+const FULL_NODE_RECHECK_MS = 2 * 60_000;
 /** Smart Auto waits for the routes to settle before its download. */
 const TRAFFIC_CHECK_DELAY_MS = 1_500;
 /** After the remote list was shown, events keep it current this long. */
@@ -245,6 +261,14 @@ export class AppController extends EventEmitter<AppControllerEvents> {
   private readonly remoteConfigStore = new RemoteConfigStore(join(app.getPath("userData"), "remote-config.json"));
   private readonly endpointsStore = new ServiceEndpointsStore(join(app.getPath("userData"), "service-endpoints.json"));
   private remoteStored: StoredRemoteConfig | null = null;
+  /** Node load, full nodes and quality, docs/app-platform.md "Node load". */
+  private readonly liveLoadClient = new LiveLoadClient("macos", app.getVersion());
+  private liveLoad: LiveLoad | null = null;
+  private liveLoadRefresh: Promise<void> | null = null;
+  /** Since when each server's node has been reported full, by server id. */
+  private readonly fullSince = new Map<string, number>();
+  private lastOverloadMoveAt: number | null = null;
+  private overloadMoving = false;
   private remoteRefresh: Promise<void> | null = null;
   private readonly notices = new NoticeState(join(app.getPath("userData"), "notices.json"));
   private settingsRevision = 0;
@@ -548,6 +572,31 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     }
   }
 
+  /** The user picked a server in the list: Smart Auto stops choosing for them. */
+  async chooseServer(serverId: string): Promise<void> {
+    if (!this.state.servers.some((item) => item.id === serverId)) throw new Error("Сервер не найден");
+    if (this.state.settings.automaticServer) await this.updateSettings({ automaticServer: false });
+    await this.selectServer(serverId);
+  }
+
+  /** The user picked a country: its best server, chosen by hand from then on. */
+  async chooseCountry(countryCode: string): Promise<void> {
+    if (!countryServers(this.state.servers, countryCode).length) throw new Error("Страна не найдена");
+    if (this.state.settings.automaticServer) await this.updateSettings({ automaticServer: false });
+    await this.selectCountry(countryCode);
+  }
+
+  /**
+   * «Автоматически» in the server list, docs/app-platform.md "Smart Auto":
+   * Smart Auto picks the server now and on every connection.
+   */
+  async selectAutomatic(): Promise<void> {
+    if (!this.state.settings.automaticServer) await this.updateSettings({ automaticServer: true });
+    await Promise.all([this.refreshLiveLoad(), this.pingServers()]);
+    const best = this.bestServer(this.state.servers);
+    if (best && best.id !== this.state.selectedServerId) await this.selectServer(best.id);
+  }
+
   /**
    * The best server of a country, docs/app-platform.md "Server list". A server
    * of the country that is already selected stays.
@@ -570,9 +619,16 @@ export class AppController extends EventEmitter<AppControllerEvents> {
       if (!subscriptionId) throw new Error("Выберите активную подписку");
       await this.loadTunnelProfile(subscriptionId);
     }
-    if (this.state.settings.automaticServer && !hasMeasuredLatency(this.state.serverLatencies)) {
-      await this.pingServers();
+    // A new automatic session: fresh load (1.5 s at most) and pings, then the best
+    // server by them. A server switch inside a session keeps the server it was given.
+    const newAutomaticSession = this.state.settings.automaticServer && !this.telemetry.active;
+    if (this.state.settings.automaticServer && (newAutomaticSession || !hasMeasuredLatency(this.state.serverLatencies))) {
+      await Promise.all([
+        newAutomaticSession ? this.refreshLiveLoad() : Promise.resolve(),
+        !hasMeasuredLatency(this.state.serverLatencies) ? this.pingServers() : Promise.resolve(),
+      ]);
     }
+    if (newAutomaticSession) await this.followBestServer(this.state.servers);
     const server = this.selectedServer();
     if (!server || !this.profile) throw new Error("Выберите VPN-сервер");
     if (!this.telemetry.active) {
@@ -711,17 +767,10 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     if (this.pingPromise) return this.pingPromise;
     const servers = [...this.state.servers];
     this.pingPromise = (async () => {
-      const latencies = await measureServerLatencies(servers);
+      const [latencies] = await Promise.all([measureServerLatencies(servers), this.refreshLiveLoad()]);
       if (!sameServers(servers, this.state.servers)) return;
       this.patch({ serverLatencies: latencies });
-      if (this.state.settings.automaticServer && !this.xray.isRunning()) {
-        const best = this.bestServer(servers);
-        if (best && best.id !== this.state.selectedServerId) {
-          this.state.selectedServerId = best.id;
-          await this.secureStore.put("selected_server", Buffer.from(best.id));
-          this.emitChanged();
-        }
-      }
+      await this.followBestServer(servers);
     })().finally(() => { this.pingPromise = null; });
     return this.pingPromise;
   }
@@ -2086,15 +2135,117 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     return this.remoteStored?.config.maintenance ?? [];
   }
 
-  /** Node load by server id for the list. */
+  /** Node load by server id for the list; a full node shows as full. */
   private serverLoad(now: number): Record<string, number> {
-    const load = currentNodeLoad(this.remoteStored, now);
+    const view = this.loadView(now);
     const marked: Record<string, number> = {};
+    if (view.ageMs >= LOAD_FORGET_MS) return marked;
     for (const server of this.state.servers) {
-      const value = nodeLoadForServer(load, server);
+      const value = nodeLoadForServer(view.full, server) !== null ? 1 : nodeLoadForServer(view.load, server);
       if (value !== null) marked[server.id] = value;
     }
     return marked;
+  }
+
+  /**
+   * The newest load the app has: the live answer, or the configuration's
+   * when that came later (an older website has no live endpoint).
+   */
+  private loadView(now: number): {
+    load: Record<string, number>;
+    ageMs: number;
+    full: Record<string, number>;
+    quality: Record<string, number>;
+  } {
+    const live = this.liveLoad;
+    const config = this.remoteStored;
+    const useLive = live !== null && (config === null || live.fetchedAt >= config.fetchedAt);
+    const fetchedAt = useLive ? live.fetchedAt : config?.fetchedAt ?? 0;
+    const fullFresh = live !== null && now - live.fetchedAt < LOAD_FORGET_MS;
+    return {
+      load: useLive ? live.load : config?.config.nodeLoad ?? {},
+      ageMs: now - fetchedAt,
+      full: Object.fromEntries((fullFresh ? live.full : []).map((id) => [id, 1])),
+      quality: currentQuality(live, now),
+    };
+  }
+
+  /**
+   * Asks for the live load when the last answer is older than [maxAgeMs] and
+   * waits [waitMs] at most: a slow answer serves the next choice.
+   */
+  private async refreshLiveLoad(maxAgeMs = LIVE_LOAD_MAX_AGE_MS, waitMs = 1_500): Promise<void> {
+    if (this.liveLoad && Date.now() - this.liveLoad.fetchedAt < maxAgeMs) return;
+    this.liveLoadRefresh ??= (async () => {
+      const throughTunnel = this.tunnelActive();
+      const answer = await this.liveLoadClient.fetch(this.liveLoad?.etag ?? null);
+      if (!answer) return;
+      const now = Date.now();
+      this.liveLoad = mergeLiveLoad(this.liveLoad, answer, now, throughTunnel);
+      this.trackFullServers(now);
+      const load = this.serverLoad(now);
+      if (JSON.stringify(load) !== JSON.stringify(this.state.serverLoad)) this.patch({ serverLoad: load });
+    })().catch(() => {}).finally(() => {
+      this.liveLoadRefresh = null;
+    });
+    await Promise.race([this.liveLoadRefresh, delay(waitMs)]);
+  }
+
+  /** Remembers since when each server's node has been full; a node with room again is forgotten. */
+  private trackFullServers(now: number): void {
+    const full = this.loadView(now).full;
+    for (const server of this.state.servers) {
+      if (nodeLoadForServer(full, server) === null) this.fullSince.delete(server.id);
+      else if (!this.fullSince.has(server.id)) this.fullSince.set(server.id, now);
+    }
+  }
+
+  /**
+   * Stage 4, docs/app-platform.md "Smart Auto": an automatic connection on a
+   * node that stayed full moves, but only while it is idle, so nothing the
+   * user does is cut, and at most every half hour.
+   */
+  private async checkOverload(current: TunnelServer, now: number): Promise<void> {
+    if (this.overloadMoving || !this.state.settings.automaticServer || isHomeRoadServer(current.name) || current.tuic) return;
+    const since = this.fullSince.get(current.id) ?? null;
+    if (since === null) return;
+    // Confirm with fresh readings while the node is full.
+    void this.refreshLiveLoad(FULL_NODE_RECHECK_MS, 0);
+    const due = (bestScore: number | null) => overloadMoveDue({
+      fullSince: this.fullSince.get(current.id) ?? null,
+      loadAgeMs: now - (this.liveLoad?.fetchedAt ?? 0),
+      idle: this.idleMeter.idle(now),
+      lastMoveAt: this.lastOverloadMoveAt,
+      currentScore: this.currentScore(current, now),
+      bestScore,
+      now,
+    });
+    // Everything but the comparison first: pings cost something.
+    if (!due(0)) return;
+    this.overloadMoving = true;
+    try {
+      await this.pingServers();
+      const others = this.automaticCandidates(this.state.servers.filter((item) => item.id !== current.id));
+      const best = this.rankServers(others)[0];
+      const target = best ? others.find((item) => item.id === best.id) : undefined;
+      if (!best || !target || this.fullSince.has(target.id) || !due(best.score)) return;
+      if (this.state.status !== "connected" || this.state.selectedServerId !== current.id) return;
+      this.lastOverloadMoveAt = Date.now();
+      this.addLog(`Smart Auto: сервер ${current.name} перегружен, переключение на ${target.name}`);
+      this.nextAttemptCause = "server_switch";
+      await this.selectServer(target.id);
+      if (this.state.status === "connected") this.patch({ statusDetail: `Сервер «${current.name}» перегружен. Переключились на «${target.name}»` });
+    } catch (error) {
+      this.addLog(`Smart Auto: переключение с перегруженного сервера: ${messageOf(error)}`);
+    } finally {
+      this.overloadMoving = false;
+    }
+  }
+
+  private currentScore(server: TunnelServer, now: number): number {
+    const history = this.protocolHistory.current();
+    const network = this.protocolHistory.networkKey();
+    return smartScore(this.smartCandidate(server, this.loadView(now), now, history, network), currentAdvice(this.remoteStored, now));
   }
 
   /** Servers the list marks as under maintenance, with the end of the work. */
@@ -2121,7 +2272,15 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     const current = this.selectedServer();
     if (!current) return;
     const move = maintenanceMove(maintenanceFor(this.maintenanceWindows(), nodeIdForServer(current), now), now);
-    if (move === "stay" || (move === "when-idle" && !this.idleMeter.idle(now))) return;
+    if (move === "stay") {
+      if (this.state.settings.automaticServer) {
+        // A running automatic connection learns about a full node within ten minutes.
+        void this.refreshLiveLoad(LIVE_LOAD_CONNECTED_EVERY_MS, 0);
+        await this.checkOverload(current, now);
+      }
+      return;
+    }
+    if (move === "when-idle" && !this.idleMeter.idle(now)) return;
     // The same country first, docs/app-platform.md "Server list".
     const others = this.state.servers.filter((item) => item.id !== current.id);
     const neighbours = countryServers(others, current.countryCode);
@@ -2207,20 +2366,42 @@ export class AppController extends EventEmitter<AppControllerEvents> {
   /** Best first, docs/app-platform.md "Smart Auto". */
   private rankServers(servers: readonly TunnelServer[]): RankedServer[] {
     const now = Date.now();
-    const load = currentNodeLoad(this.remoteStored, now);
+    const view = this.loadView(now);
     const history = this.protocolHistory.current();
     const network = this.protocolHistory.networkKey();
-    return rankSmart(servers.map((server) => {
-      const protocol = protocolOf(server);
-      return {
-        id: server.id,
-        protocol,
-        latencyMs: this.state.serverLatencies[server.id] ?? null,
-        silenceMeansDown: silenceMeansDown(server.outbound),
-        load: nodeLoadForServer(load, server),
-        verdict: verdictOf(history, network, protocol, now),
-      };
-    }), currentAdvice(this.remoteStored, now));
+    const candidates = servers.map((server) => this.smartCandidate(server, view, now, history, network));
+    return rankSmart(candidates, currentAdvice(this.remoteStored, now), spreadSeed(this.protocolHistory.localSalt(), now));
+  }
+
+  private smartCandidate(
+    server: TunnelServer,
+    view: ReturnType<AppController["loadView"]>,
+    now: number,
+    history: ProtocolHistory,
+    network: string | null,
+  ): SmartCandidate {
+    const protocol = protocolOf(server);
+    const nodeId = nodeIdForServer(server);
+    return {
+      id: server.id,
+      protocol,
+      latencyMs: this.state.serverLatencies[server.id] ?? null,
+      silenceMeansDown: silenceMeansDown(server.outbound),
+      load: agedLoad(nodeLoadForServer(view.load, server), view.ageMs),
+      verdict: verdictOf(history, network, protocol, now),
+      quality: nodeId ? view.quality[nodeId] ?? null : null,
+      full: nodeLoadForServer(view.full, server) !== null,
+    };
+  }
+
+  /** Smart Auto's choice while no tunnel runs: the selection follows the best server. */
+  private async followBestServer(servers: TunnelServer[]): Promise<void> {
+    if (!this.state.settings.automaticServer || this.xray.isRunning()) return;
+    const best = this.bestServer(servers);
+    if (!best || best.id === this.state.selectedServerId) return;
+    this.state.selectedServerId = best.id;
+    await this.secureStore.put("selected_server", Buffer.from(best.id));
+    this.emitChanged();
   }
 
   /** After an automatic connection: does the tunnel carry a real download? */
@@ -2241,10 +2422,13 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     void (async () => {
       await delay(delayMs);
       if (!current()) return;
-      const passed = await carriesTraffic(current);
+      const elapsed = await measureTraffic(current);
+      const passed = elapsed !== null;
       if (!current()) return;
       const network = this.protocolHistory.networkKey();
       const protocol = protocolOf(server);
+      const checkedNode = nodeIdForServer(server);
+      if (passed && checkedNode) this.telemetry.record((session) => session.trafficCheck(checkedNode, elapsed, true));
       if (passed) {
         this.smartLadder.reset();
         if (network) await this.protocolHistory.update((history) => recordSuccess(history, network, protocol, Date.now(), server.id));
@@ -2253,6 +2437,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
       // No handshake either: the tunnel is down, which the health check handles.
       // A handshake without a download is a throttled protocol.
       if (!await isTunnelHealthy() || !current()) return;
+      if (checkedNode) this.telemetry.record((session) => session.trafficCheck(checkedNode, FAILED_TRAFFIC_CHECK_MS, false));
       if (network) {
         const node = nodeIdForServer(server) ?? server.id;
         await this.protocolHistory.update((history) => recordFailure(history, network, protocol, node, Date.now(), server.id));

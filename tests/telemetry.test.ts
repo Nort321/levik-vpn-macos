@@ -278,6 +278,8 @@ describe("DiskLog", () => {
       .toBe("GET https://api.leviknet.org/v1/x?<query> <ip6> <id>");
     expect(redactLogLine("2026/10/10 13:14:04 Xray 26.7.28 loaded config.json")).toBe("2026/10/10 13:14:04 Xray 26.7.28 loaded config.json");
     expect(redactLogLine("dial [fe80:0:0:0:1:2:3:4]:443")).toBe("dial [<ip6>]:443");
+    expect(redactLogLine("Состояние: reconnecting — Туннель остановлен (код ?). Восстановление…"))
+      .toBe("Состояние: reconnecting — Туннель остановлен (код ?). Восстановление…");
   });
 
   it("keeps two rotating files and skips per-connection lines", async () => {

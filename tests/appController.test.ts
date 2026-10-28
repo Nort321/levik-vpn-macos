@@ -184,3 +184,159 @@ describe("AppController login lifecycle", () => {
     }
   });
 });
+
+describe("AppController while the Mac sleeps", () => {
+  const server = (id: string, address: string, protocol = "vless") => ({
+    id, tag: id, name: id.toUpperCase(), countryCode: "DE", outbound: { protocol, settings: { vnext: [{ address }] } },
+  });
+
+  it("does not move off a server before maintenance while asleep", async () => {
+    const controller = new AppController();
+    controller.cancelLogin();
+    const now = Date.now();
+    Reflect.set(controller, "remoteStored", {
+      config: { maintenance: [{ nodeId: nodeIdForHost("de1.example.net"), startsAt: now + 60_000, endsAt: now + 3_600_000 }], nodeLoad: {} },
+      fetchedAt: now,
+    });
+    Reflect.set(controller, "xray", { isRunning: () => true, setSuspended: vi.fn() });
+    const state = Reflect.get(controller, "state") as Record<string, unknown>;
+    Object.assign(state, {
+      status: "connected",
+      busy: false,
+      servers: [server("de1", "de1.example.net"), server("de2", "de2.example.net")],
+      selectedServerId: "de1",
+      serverLatencies: { de1: 20, de2: 60 },
+    });
+    const selectServer = vi.spyOn(controller, "selectServer").mockResolvedValue();
+    const check = Reflect.get(controller, "checkMaintenance") as () => Promise<void>;
+
+    controller.recordPowerEvent("suspend");
+    await check.call(controller);
+    expect(selectServer).not.toHaveBeenCalled();
+
+    controller.recordPowerEvent("resume");
+    await check.call(controller);
+    expect(selectServer).toHaveBeenCalledWith("de2");
+  });
+
+  it("reconnects on wake a connection that failed on its own, through the server that last worked", async () => {
+    vi.useFakeTimers();
+    try {
+      const controller = new AppController();
+      controller.cancelLogin();
+      Reflect.set(controller, "xray", { isRunning: () => false, setSuspended: vi.fn() });
+      Reflect.set(controller, "accessToken", "token");
+      Reflect.set(controller, "lastWorkingServerId", "de1");
+      const state = Reflect.get(controller, "state") as Record<string, unknown>;
+      Object.assign(state, {
+        status: "error",
+        busy: false,
+        servers: [server("de1", "de1.example.net"), server("pl1", "pl1.example.net", "hysteria2")],
+        selectedServerId: "pl1",
+      });
+      const selectServer = vi.spyOn(controller, "selectServer").mockResolvedValue();
+      const connect = vi.spyOn(controller, "connect").mockResolvedValue();
+
+      const restore = controller.restoreAfterSystemResume();
+      await vi.advanceTimersByTimeAsync(1_500);
+      await restore;
+
+      expect(selectServer).toHaveBeenCalledWith("de1");
+      expect(connect).toHaveBeenCalledWith("resume");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("leaves an error alone when the user turned the VPN off or never got it working", async () => {
+    const controller = new AppController();
+    controller.cancelLogin();
+    Reflect.set(controller, "xray", { isRunning: () => false, setSuspended: vi.fn() });
+    Reflect.set(controller, "accessToken", "token");
+    const state = Reflect.get(controller, "state") as Record<string, unknown>;
+    Object.assign(state, { status: "error", busy: false, servers: [server("de1", "de1.example.net")], selectedServerId: "de1" });
+    const connect = vi.spyOn(controller, "connect").mockResolvedValue();
+
+    await controller.restoreAfterSystemResume();
+
+    expect(connect).not.toHaveBeenCalled();
+  });
+
+  it("does not check traffic or climb to another protocol while asleep", async () => {
+    const controller = new AppController();
+    controller.cancelLogin();
+    Reflect.set(controller, "xray", { isRunning: () => true, setSuspended: vi.fn(), serviceRoutes: { active: false } });
+    const state = Reflect.get(controller, "state") as Record<string, unknown>;
+    Object.assign(state, {
+      status: "connected",
+      servers: [server("de1", "de1.example.net"), server("se1", "se1.example.net", "hysteria2")],
+      selectedServerId: "de1",
+      serverLatencies: { de1: 20, se1: 60 },
+    });
+    const selectServer = vi.spyOn(controller, "selectServer").mockResolvedValue();
+    controller.recordPowerEvent("suspend");
+
+    (Reflect.get(controller, "launchTrafficCheck") as (delayMs: number, alarm?: boolean) => void).call(controller, 0, true);
+    expect(Reflect.get(controller, "trafficCheck")).toBeNull();
+    const climb = Reflect.get(controller, "climbProtocolLadder") as (failed: unknown, protocol: string) => Promise<void>;
+    await climb.call(controller, (state.servers as unknown[])[0], "vless-tcp");
+    expect(selectServer).not.toHaveBeenCalled();
+  });
+});
+
+describe("AppController Smart Auto ladder", () => {
+  it("connects again when the next protocol does not connect, instead of staying off", async () => {
+    const server = (id: string, address: string, protocol: string) => ({
+      id, tag: id, name: id.toUpperCase(), countryCode: "DE", outbound: { protocol, settings: { vnext: [{ address }] } },
+    });
+    const controller = new AppController();
+    controller.cancelLogin();
+    Reflect.set(controller, "xray", { isRunning: () => false, setSuspended: vi.fn(), serviceRoutes: { active: false } });
+    Reflect.set(controller, "protocolHistory", {
+      networkKey: () => null, current: () => ({ networks: [], winners: {} }), localSalt: () => "salt", update: vi.fn(),
+    });
+    const state = Reflect.get(controller, "state") as Record<string, unknown>;
+    const servers = [server("de1", "de1.example.net", "vless"), server("pl1", "pl1.example.net", "hysteria2")];
+    Object.assign(state, { status: "connected", servers, selectedServerId: "de1", serverLatencies: { de1: 20, pl1: 60 } });
+    const selectServer = vi.spyOn(controller, "selectServer").mockImplementation(async (id: string) => {
+      state.selectedServerId = id;
+      if (id === "pl1") {
+        state.status = "error";
+        throw new Error("Не найден исходящий сетевой интерфейс");
+      }
+    });
+    const connect = vi.spyOn(controller, "connect").mockResolvedValue();
+
+    const climb = Reflect.get(controller, "climbProtocolLadder") as (failed: unknown, protocol: string) => Promise<void>;
+    await climb.call(controller, servers[0], "vless-tcp");
+
+    expect(selectServer.mock.calls.map(([id]) => id)).toEqual(["pl1", "de1"]);
+    expect(connect).toHaveBeenCalledOnce();
+  });
+});
+
+describe("AppController account rules", () => {
+  it("checks rule changes one at a time", async () => {
+    const controller = new AppController();
+    controller.cancelLogin();
+    const order: string[] = [];
+    let release: (() => void) | undefined;
+    const now = vi.spyOn(controller as unknown as { applyAccountRulesNow: () => Promise<void> }, "applyAccountRulesNow")
+      .mockImplementationOnce(() => new Promise<void>((resolve) => {
+        order.push("first start");
+        release = () => { order.push("first end"); resolve(); };
+      }))
+      .mockImplementationOnce(async () => { order.push("second"); });
+    const apply = Reflect.get(controller, "applyAccountRules") as () => Promise<void>;
+
+    const first = apply.call(controller);
+    const second = apply.call(controller);
+    await vi.waitFor(() => expect(release).toBeDefined());
+    expect(order).toEqual(["first start"]);
+    release?.();
+    await Promise.all([first, second]);
+
+    expect(order).toEqual(["first start", "first end", "second"]);
+    expect(now).toHaveBeenCalledTimes(2);
+  });
+});

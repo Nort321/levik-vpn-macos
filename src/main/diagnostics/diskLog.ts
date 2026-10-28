@@ -15,7 +15,8 @@ export function redactLogLine(line: string): string {
     .replace(/[\u0000-\u001f]/g, " ")
     .replace(/\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b/g, "<email>")
     .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, "<id>")
-    .replace(/\?[^\s"'<>]+/g, "?<query>")
+    // Only a query that follows a path: "(код ?)." in a message is not one.
+    .replace(/(?<=[\w/.-])\?[^\s"'<>]+/g, "?<query>")
     .replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, "<ip>")
     // Full or "::"-compressed IPv6; clock times such as 13:14:04 do not match.
     .replace(/(?<![\w:.])(?:(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}|(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*)?::(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*)?)(?![\w:])/gi, "<ip6>")

@@ -154,6 +154,8 @@ const MAINTENANCE_CHECK_MS = 15_000;
 const FULL_NODE_RECHECK_MS = 2 * 60_000;
 /** Smart Auto waits for the routes to settle before its download. */
 const TRAFFIC_CHECK_DELAY_MS = 1_500;
+/** A failed check after a freeze alarm is repeated after this pause before the connection moves. */
+const TRAFFIC_RECHECK_MS = 20_000;
 /** After the remote list was shown, events keep it current this long. */
 const REMOTE_WATCH_MS = 10 * 60_000;
 const MAX_HANDLED_COMMANDS = 200;
@@ -247,6 +249,15 @@ export class AppController extends EventEmitter<AppControllerEvents> {
   private trafficCheck: symbol | null = null;
   private climbingLadder = false;
   private resumePromise: Promise<void> | null = null;
+  /**
+   * Between the system's suspend and resume. Maintenance wakes still run timers
+   * with the network half up, so nothing automatic may judge or move the tunnel.
+   */
+  private systemAsleep = false;
+  /** The server that last carried this connection; cleared when the VPN is turned off. */
+  private lastWorkingServerId: string | null = null;
+  /** Account rule checks run one at a time, so one change reconnects once. */
+  private accountRulesRun: Promise<void> = Promise.resolve();
   private diagnosisPromise: Promise<DiagnosisSummary> | null = null;
   private lastDiagnosis: { at: number; summary: DiagnosisSummary } | null = null;
   private killSwitchHealthTimer: ReturnType<typeof setInterval> | null = null;
@@ -678,6 +689,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
   }
 
   private async stopConnection(by: EndBy, code: string | null): Promise<void> {
+    this.lastWorkingServerId = null;
     void this.telemetry.finish(by, code);
     if (!this.xray.isRunning()) {
       await Promise.all([
@@ -876,6 +888,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
 
   async restoreAfterSystemResume(): Promise<void> {
     if (this.resumePromise) return this.resumePromise;
+    if (this.state.status === "error") return this.reconnectAfterWake();
     if (!this.lastConfig || !["connected", "reconnecting"].includes(this.state.status)) return;
     let progress: AttemptProgress | null = null;
     this.resumePromise = (async () => {
@@ -906,8 +919,30 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     return this.resumePromise;
   }
 
+  /**
+   * A connection that was working and failed without the user, for example
+   * while the Mac slept, comes back on wake through the server that last
+   * carried it. A connection the user never got working stays as it is.
+   */
+  private reconnectAfterWake(): Promise<void> {
+    const serverId = this.lastWorkingServerId;
+    if (!serverId || !this.state.settings.autoReconnect || !this.accessToken || this.state.busy) return Promise.resolve();
+    this.resumePromise = (async () => {
+      await delay(1_500);
+      if (this.state.status !== "error" || this.xray.isRunning() || this.lastWorkingServerId !== serverId) return;
+      if (!this.state.servers.some((item) => item.id === serverId)) return;
+      this.addLog("Восстановление после сна: повторное подключение");
+      if (this.state.selectedServerId !== serverId) await this.selectServer(serverId);
+      await this.connect("resume");
+    })().catch((error: unknown) => {
+      this.addLog(`Восстановление после сна: ${messageOf(error)}`);
+    }).finally(() => { this.resumePromise = null; });
+    return this.resumePromise;
+  }
+
   /** Sleep explains drops that are not the server's fault. */
   recordPowerEvent(state: Extract<PowerState, "suspend" | "resume">): void {
+    this.systemAsleep = state === "suspend";
     this.xray.setSuspended(state === "suspend");
     this.telemetry.record((session) => session.power(state));
     if (state === "suspend") void this.telemetry.persist();
@@ -1398,7 +1433,13 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     }
   }
 
-  private async applyAccountRules(): Promise<void> {
+  private applyAccountRules(): Promise<void> {
+    // Two notices of one change must not both see the old rules and reconnect twice.
+    this.accountRulesRun = this.accountRulesRun.then(() => this.applyAccountRulesNow());
+    return this.accountRulesRun;
+  }
+
+  private async applyAccountRulesNow(): Promise<void> {
     const subscriptionId = this.state.selectedSubscriptionId;
     if (!this.accessToken || !subscriptionId || this.state.busy) return;
     const before = ruleRoutingKey(this.profile);
@@ -1939,6 +1980,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
   }
 
   private async clearLocalSession(statusDetail: string | null): Promise<void> {
+    this.lastWorkingServerId = null;
     if (this.serviceRoutesRetry) clearTimeout(this.serviceRoutesRetry);
     this.serviceRoutesRetry = null;
     await this.serviceRouteState.clear();
@@ -2056,9 +2098,11 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     const totalUpload = this.trafficUploadOffset + uploadBytes;
     this.idleMeter.record(totalDownload + totalUpload, Date.now());
     // A tunnel that sends but hardly receives: the same check as after connecting.
-    if (this.state.status === "connected" && this.freezeDetector.record(totalDownload, totalUpload, Date.now())) {
+    // Only an automatic connection acts on it, so only it is watched.
+    if (this.state.status === "connected" && !this.systemAsleep && this.trafficCheckApplies()
+      && this.freezeDetector.record(totalDownload, totalUpload, Date.now())) {
       this.addLog("Smart Auto: туннель отправляет, но почти не получает данные; проверяем трафик");
-      this.launchTrafficCheck(0);
+      this.launchTrafficCheck(0, true);
     }
     if (totalDownload !== this.state.downloadBytes || totalUpload !== this.state.uploadBytes) {
       this.patch({ downloadBytes: totalDownload, uploadBytes: totalUpload });
@@ -2111,7 +2155,8 @@ export class AppController extends EventEmitter<AppControllerEvents> {
   }
 
   private async stopTunnelForReplacement(): Promise<void> {
-    this.nextAttemptCause = "server_switch";
+    // Smart Auto's move keeps its own cause, so the session counts it as a failover.
+    if (this.nextAttemptCause !== "failover") this.nextAttemptCause = "server_switch";
     this.patch({ status: "reconnecting", statusDetail: "Применение изменений соединения…" });
     await this.xray.stop();
     this.lockdownActive = false;
@@ -2229,7 +2274,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
       const best = this.rankServers(others)[0];
       const target = best ? others.find((item) => item.id === best.id) : undefined;
       if (!best || !target || this.fullSince.has(target.id) || !due(best.score)) return;
-      if (this.state.status !== "connected" || this.state.selectedServerId !== current.id) return;
+      if (this.systemAsleep || this.state.status !== "connected" || this.state.selectedServerId !== current.id) return;
       this.lastOverloadMoveAt = Date.now();
       this.addLog(`Smart Auto: сервер ${current.name} перегружен, переключение на ${target.name}`);
       this.nextAttemptCause = "server_switch";
@@ -2268,7 +2313,8 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     if (JSON.stringify(marked) !== JSON.stringify(this.state.serverMaintenance)) this.patch({ serverMaintenance: marked });
     const load = this.serverLoad(now);
     if (JSON.stringify(load) !== JSON.stringify(this.state.serverLoad)) this.patch({ serverLoad: load });
-    if (this.maintenanceMoving || this.state.busy || this.state.status !== "connected" || !this.xray.isRunning()) return;
+    // A sleeping Mac looks idle: moves wait until it wakes.
+    if (this.maintenanceMoving || this.state.busy || this.systemAsleep || this.state.status !== "connected" || !this.xray.isRunning()) return;
     const current = this.selectedServer();
     if (!current) return;
     const move = maintenanceMove(maintenanceFor(this.maintenanceWindows(), nodeIdForServer(current), now), now);
@@ -2411,25 +2457,40 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     this.launchTrafficCheck(delayMs);
   }
 
-  private launchTrafficCheck(delayMs: number): void {
-    if (this.xray.serviceRoutes?.active) return;
+  /** Whether Smart Auto checks this connection's traffic: an automatic one, not a home road or service routes. */
+  private trafficCheckApplies(): boolean {
     const server = this.selectedServer();
-    if (!server || !this.state.settings.automaticServer || this.trafficCheck || isHomeRoadServer(server.name)) return;
-    const current = (): boolean => this.xray.isRunning()
+    return !this.xray.serviceRoutes?.active && this.state.settings.automaticServer && !!server && !isHomeRoadServer(server.name);
+  }
+
+  /**
+   * [alarm]: the freeze detector asked, so the user's own uploads may be what
+   * it saw; a failed check is repeated once before the connection moves.
+   */
+  private launchTrafficCheck(delayMs: number, alarm = false): void {
+    const server = this.selectedServer();
+    if (!server || !this.trafficCheckApplies() || this.trafficCheck || this.systemAsleep) return;
+    const current = (): boolean => this.xray.isRunning() && !this.systemAsleep
       && this.state.status === "connected" && this.state.selectedServerId === server.id;
     const check = Symbol("traffic-check");
     this.trafficCheck = check;
     void (async () => {
       await delay(delayMs);
       if (!current()) return;
-      const elapsed = await measureTraffic(current);
-      const passed = elapsed !== null;
+      let elapsed = await measureTraffic(current);
+      if (elapsed === null && alarm) {
+        await delay(TRAFFIC_RECHECK_MS);
+        if (!current()) return;
+        elapsed = await measureTraffic(current);
+      }
       if (!current()) return;
       const network = this.protocolHistory.networkKey();
       const protocol = protocolOf(server);
       const checkedNode = nodeIdForServer(server);
-      if (passed && checkedNode) this.telemetry.record((session) => session.trafficCheck(checkedNode, elapsed, true));
-      if (passed) {
+      if (elapsed !== null) {
+        const took = elapsed;
+        if (checkedNode) this.telemetry.record((session) => session.trafficCheck(checkedNode, took, true));
+        if (alarm) this.freezeDetector.checkPassed();
         this.smartLadder.reset();
         if (network) await this.protocolHistory.update((history) => recordSuccess(history, network, protocol, Date.now(), server.id));
         return;
@@ -2450,8 +2511,13 @@ export class AppController extends EventEmitter<AppControllerEvents> {
       .finally(() => { if (this.trafficCheck === check) this.trafficCheck = null; });
   }
 
-  /** The next rung: the best server of a protocol not tried yet, a few moves at most. */
+  /**
+   * The next rung: the best server of a protocol not tried yet, a few moves at
+   * most. A rung that does not connect is remembered as failing on this
+   * network, and the VPN connects again instead of staying off.
+   */
   private async climbProtocolLadder(failed: TunnelServer, protocol: string): Promise<void> {
+    if (this.systemAsleep) return;
     this.smartLadder.tried(failed.id, protocol);
     if (this.smartLadder.exhausted()) {
       this.addLog("Smart Auto: проверены несколько протоколов, остаёмся на текущем сервере");
@@ -2460,11 +2526,23 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     const candidates = this.automaticCandidates(this.state.servers);
     const next = nextRung(this.rankServers(candidates), this.smartLadder.triedProtocols(), this.smartLadder.triedIds());
     if (!next || next.id === failed.id) return;
+    const target = this.state.servers.find((item) => item.id === next.id);
+    if (!target) return;
     this.smartLadder.climbed();
     this.nextAttemptCause = "failover";
     this.climbingLadder = true;
     try {
       await this.selectServer(next.id);
+    } catch (error) {
+      this.smartLadder.tried(next.id, next.protocol);
+      const network = this.protocolHistory.networkKey();
+      if (network) {
+        const node = nodeIdForServer(target) ?? target.id;
+        await this.protocolHistory.update((history) => recordFailure(history, network, next.protocol, node, Date.now(), target.id));
+      }
+      this.addLog(`Smart Auto: ${target.name} не подключился (${messageOf(error)}); переподключение`);
+      await this.reconnectAfterFailedRung(failed.id);
+      return;
     } finally {
       this.climbingLadder = false;
     }
@@ -2472,6 +2550,24 @@ export class AppController extends EventEmitter<AppControllerEvents> {
       const notice = `${protocolLabel(protocol)} не работает в этой сети. Переключились на ${protocolLabel(next.protocol)}`;
       this.addLog(`Smart Auto: ${notice}`);
       this.patch({ statusDetail: notice });
+    }
+  }
+
+  /**
+   * After a rung failed: the server Smart Auto left, or in automatic mode the
+   * best one now that the failed rung counts against its protocol.
+   */
+  private async reconnectAfterFailedRung(serverId: string): Promise<void> {
+    if (this.state.status !== "error" || this.xray.isRunning() || this.systemAsleep) return;
+    if (!this.state.servers.some((item) => item.id === serverId)) return;
+    this.climbingLadder = true;
+    try {
+      await this.selectServer(serverId);
+      await this.connect("unknown");
+    } catch (error) {
+      this.addLog(`Smart Auto: ${messageOf(error)}`);
+    } finally {
+      this.climbingLadder = false;
     }
   }
 
@@ -2522,6 +2618,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
   }
 
   private recordConnected(): void {
+    this.lastWorkingServerId = this.state.selectedServerId;
     this.telemetry.record((session) => session.connected());
     // Reports leave through the working tunnel, after it has settled.
     this.telemetry.flushSoon();

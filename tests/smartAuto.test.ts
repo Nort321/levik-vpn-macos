@@ -127,6 +127,25 @@ describe("tunnel freeze detector", () => {
     expect(detector.record(105 * 1024, 100 * 1024, 26_000)).toBe(false);
   });
 
+  it("waits longer after each passed check and starts short again after a quiet hour", () => {
+    const detector = new TunnelFreezeDetector();
+    const upload = (at: number, base: number): boolean => {
+      detector.record(base, base, at);
+      return detector.record(base, base + 50 * 1024, at + 12_000);
+    };
+    expect(upload(0, 0)).toBe(true);
+    detector.checkPassed();
+    // Four minutes now, not two.
+    expect(upload(3 * 60_000, 1_000_000)).toBe(false);
+    expect(upload(5 * 60_000, 2_000_000)).toBe(true);
+    detector.checkPassed();
+    expect(upload(12 * 60_000, 3_000_000)).toBe(false);
+    expect(upload(14 * 60_000, 4_000_000)).toBe(true);
+    // An hour without alarms: the wait is two minutes again.
+    expect(upload(80 * 60_000, 5_000_000)).toBe(true);
+    expect(upload(83 * 60_000, 6_000_000)).toBe(true);
+  });
+
   it("ignores ordinary browsing", () => {
     const detector = new TunnelFreezeDetector();
     detector.record(0, 0, 0);

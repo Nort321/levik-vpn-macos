@@ -415,18 +415,26 @@ export class SmartLadder {
 /**
  * Notices a tunnel that sends but hardly receives: operators that throttle a
  * protocol freeze each connection after about 16 KB, so pages hang while the
- * handshake probes still pass. Ordinary use downloads more than it uploads.
- * A hit only asks for a traffic check, so a false alarm costs 64 KB.
+ * handshake probes still pass. Ordinary browsing downloads more than it
+ * uploads, but a computer often uploads for long stretches (backups, calls,
+ * sending files), which looks the same. A hit only asks for a traffic check,
+ * so a false alarm costs 64 KB; each passed check doubles the wait before the
+ * next alarm, as on Android. A quiet hour starts the wait short again.
  */
 export class TunnelFreezeDetector {
   private samples: Array<{ at: number; rx: number; tx: number }> = [];
   private lastAlarmAt: number | null = null;
+  private currentCooldownMs: number;
 
   constructor(
     private readonly windowMs = 12_000,
     private readonly minUploadBytes = 24 * 1024,
     private readonly cooldownMs = 2 * 60_000,
-  ) {}
+    private readonly maxCooldownMs = 16 * 60_000,
+    private readonly quietResetMs = 60 * 60_000,
+  ) {
+    this.currentCooldownMs = cooldownMs;
+  }
 
   /** Totals since the connection started; true when the last window looks frozen. */
   record(rx: number, tx: number, now: number): boolean {
@@ -440,15 +448,22 @@ export class TunnelFreezeDetector {
     const sent = tx - first.tx;
     // Frozen when less than half as much comes back as goes out.
     if (sent < this.minUploadBytes || received * 2 >= sent) return false;
-    if (this.lastAlarmAt !== null && now - this.lastAlarmAt < this.cooldownMs) return false;
+    if (this.lastAlarmAt !== null && now - this.lastAlarmAt >= this.quietResetMs) this.currentCooldownMs = this.cooldownMs;
+    if (this.lastAlarmAt !== null && now - this.lastAlarmAt < this.currentCooldownMs) return false;
     this.lastAlarmAt = now;
     this.samples = [];
     return true;
   }
 
+  /** The check after an alarm passed: the tunnel was fine, so the next alarm waits longer. */
+  checkPassed(): void {
+    if (this.lastAlarmAt !== null) this.currentCooldownMs = Math.min(this.currentCooldownMs * 2, this.maxCooldownMs);
+  }
+
   reset(): void {
     this.samples = [];
     this.lastAlarmAt = null;
+    this.currentCooldownMs = this.cooldownMs;
   }
 }
 

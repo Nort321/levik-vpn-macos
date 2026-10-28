@@ -219,7 +219,8 @@ function renderHome(): string {
   if (!state) return "";
   const connected = state.status === "connected";
   const transitional = ["connecting", "disconnecting", "reconnecting"].includes(state.status);
-  const disconnectAction = connected || (state.status === "error" && state.settings.killSwitch);
+  const cancellableProbe = state.smartAutoProbing === true;
+  const disconnectAction = connected || cancellableProbe || (state.status === "error" && state.settings.killSwitch);
   const server = selectedServer();
   return `
     <header class="page-header"><div><h1>Главная</h1><div class="subtitle">Защищённый доступ к интернету</div></div></header>
@@ -227,7 +228,7 @@ function renderHome(): string {
       <section class="connection-card card">
         <div class="connection-label">Состояние соединения</div>
         <div class="connection-title ${connected ? "connected" : ""}">${statusTitle(state.status)}</div>
-        <button class="power-button ${connected ? "connected" : ""} ${transitional ? "transitioning" : ""}" id="power-button" aria-label="${transitional ? statusTitle(state.status) : disconnectAction ? "Отключить VPN" : "Подключить VPN"}" aria-busy="${transitional}" ${transitional || state.busy ? "disabled" : ""}>${icon("power")}</button>
+        <button class="power-button ${connected ? "connected" : ""} ${transitional ? "transitioning" : ""}" id="power-button" aria-label="${disconnectAction ? "Отключить VPN" : transitional ? statusTitle(state.status) : "Подключить VPN"}" aria-busy="${transitional}" ${(transitional || state.busy) && !cancellableProbe ? "disabled" : ""}>${icon("power")}</button>
         <label class="home-server-picker">
           <span class="home-server-flag" aria-hidden="true">${countryFlagSvg(server?.countryCode ?? null)}</span>
           <select id="home-server-select" aria-label="Сервер быстрого подключения" ${state.servers.length && !state.busy ? "" : "disabled"}>
@@ -924,7 +925,7 @@ function bindCommonEvents(): void {
 }
 
 function bindPageEvents(): void {
-  document.getElementById("power-button")?.addEventListener("click", () => run(() => state?.status === "connected" || (state?.status === "error" && state.settings.killSwitch) ? window.levik.disconnect() : window.levik.connect()));
+  document.getElementById("power-button")?.addEventListener("click", () => run(() => state?.smartAutoProbing === true || state?.status === "connected" || (state?.status === "error" && state.settings.killSwitch) ? window.levik.disconnect() : window.levik.connect()));
   document.getElementById("home-server-select")?.addEventListener("change", (event) => {
     const serverId = (event.target as HTMLSelectElement).value;
     if (serverId === "auto") {

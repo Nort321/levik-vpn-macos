@@ -146,6 +146,8 @@ export interface AppSnapshot {
   account: AccountSummary | null;
   servers: TunnelServer[];
   serverLatencies: Record<string, number | null>;
+  /** Independent preflight can be cancelled before the privileged tunnel starts. */
+  smartAutoProbing?: boolean;
   /** Servers going into maintenance: server id → end of the work (ms since epoch). */
   serverMaintenance: Record<string, number>;
   /** How busy each server is, 0..1, by server id; empty when the website did not say. */

@@ -453,3 +453,48 @@ describe("Smart Auto probe cancellation boundaries", () => {
     expect(Reflect.get(controller, "routeMeasurements")).toEqual({});
   });
 });
+
+
+describe("Smart Auto hot mode controller", () => {
+  it("enables the existing ordinary owner without selecting/restarting the connected server", async () => {
+    const controller = new AppController(); controller.cancelLogin();
+    const state = Reflect.get(controller, "state") as Record<string, unknown>;
+    const settings = state.settings as Record<string, unknown>; settings.automaticServer = false;
+    Object.assign(state, { status: "connected", selectedServerId: "manual" });
+    const enabled = vi.fn(async () => true), refresh = vi.fn(async () => {}), start = vi.fn(), stop = vi.fn();
+    Reflect.set(controller, "xray", { isRunning: () => true, start, stop,
+      serviceRoutes: { automaticAvailable: true, smartAutoActive: true, setAutomaticEnabled: enabled, refreshAutomatic: refresh, mainServerId: "manual" } });
+    Reflect.set(controller, "secureStore", { put: vi.fn(async () => {}) });
+    Reflect.set(controller, "applyLoginItemSettings", vi.fn());
+    Reflect.set(controller, "refreshLiveLoad", vi.fn(async () => {}));
+    Reflect.set(controller, "recordSyncedChanges", vi.fn(async () => {}));
+    Reflect.set(controller, "emitChanged", vi.fn());
+    Reflect.set(controller, "telemetry", { record: vi.fn() });
+    const select = vi.spyOn(controller, "selectServer").mockResolvedValue();
+    await controller.selectAutomatic();
+    expect(enabled).toHaveBeenCalledWith(true); expect(refresh).toHaveBeenCalledOnce();
+    expect(select).not.toHaveBeenCalled(); expect(start).not.toHaveBeenCalled(); expect(stop).not.toHaveBeenCalled();
+    expect(controller.snapshot().selectedServerId).toBe("manual");
+  });
+});
+
+describe("Smart Auto resume control isolation", () => {
+  it("preserves a live core on resume when its control API cannot answer", async () => {
+    vi.useFakeTimers();
+    try {
+      const controller = new AppController(); controller.cancelLogin();
+      const state = Reflect.get(controller, "state") as Record<string, unknown>;
+      Object.assign(state, { status: "connected" });
+      Reflect.set(controller, "lastConfig", {});
+      const recheck = vi.fn(async () => {}), restart = vi.fn(async () => {});
+      Reflect.set(controller, "xray", { isRunning: () => true, isHealthy: async () => false,
+        serviceRoutes: { smartAutoActive: true, refreshAutomatic: recheck } });
+      Reflect.set(controller, "telemetry", { record: vi.fn() });
+      Reflect.set(controller, "startXray", restart);
+      const resuming = controller.restoreAfterSystemResume();
+      await vi.advanceTimersByTimeAsync(1500); await resuming;
+      expect(restart).not.toHaveBeenCalled(); expect(recheck).toHaveBeenCalledOnce();
+      expect(controller.snapshot().status).toBe("connected");
+    } finally { vi.useRealTimers(); }
+  });
+});

@@ -48,7 +48,10 @@ export class XrayManager extends EventEmitter<XrayEvents> {
     });
     this.running = true;
     this.stopping = false;
-    try { await this.serviceRoutes.start(config); }
+    try {
+      await this.serviceRoutes.start(config);
+      if (this.serviceRoutes.authentication && !this.serviceRoutes.active && !await this.serviceRoutes.probeCurrent()) throw new Error("Выбранный VPN-сервер не отвечает");
+    }
     catch (error) { await this.stop(); throw error; }
     this.startStatsPolling();
   }
@@ -69,9 +72,11 @@ export class XrayManager extends EventEmitter<XrayEvents> {
     if (!this.running) return false;
     const generation = this.statsGeneration;
     try {
-      if (this.serviceRoutes.active) await this.serviceRoutes.queryStats();
-      else await this.statsClient.query("inbound>>>levik-tun-in>>>");
-      const healthy = this.serviceRoutes.active || await isTunnelHealthy({ onFailure });
+      if (this.serviceRoutes.authentication) {
+        if (this.serviceRoutes.active) await this.serviceRoutes.queryStats();
+      } else await this.statsClient.query("inbound>>>levik-tun-in>>>");
+      const healthy = this.serviceRoutes.active || (this.serviceRoutes.authentication
+        ? await this.serviceRoutes.probeCurrent() : await isTunnelHealthy({ onFailure }));
       return healthy && this.running && generation === this.statsGeneration;
     } catch {
       // The core's stats API is not answering, so it is not serving traffic.
@@ -126,6 +131,13 @@ export class XrayManager extends EventEmitter<XrayEvents> {
       if (generation !== this.statsGeneration || !this.running || this.suspended) return;
       this.healthFailures = healthy ? 0 : this.healthFailures + 1;
       this.emit("health", healthy ? null : codes);
+      if (!healthy && this.serviceRoutes.smartAutoActive) {
+        // An unavailable control API is not proof that existing proxy streams
+        // died. The automatic owner may recheck paths but never replaces this core.
+        this.healthFailures = 0;
+        void this.serviceRoutes.refreshAutomatic();
+        return;
+      }
       if (this.healthFailures < 3) return;
       this.emit("unhealthy");
       this.emit("log", "VPN перестал передавать трафик. Восстановление соединения…");
@@ -143,7 +155,7 @@ export class XrayManager extends EventEmitter<XrayEvents> {
     this.statsQueryRunning = true;
     const generation = this.statsGeneration;
     try {
-      const values = this.serviceRoutes.active ? await this.serviceRoutes.queryStats()
+      const values = this.serviceRoutes.authentication ? await this.serviceRoutes.queryStats()
         : await this.statsClient.query("inbound>>>levik-tun-in>>>traffic>>>");
       if (generation !== this.statsGeneration) return;
       this.statsErrorReported = false;

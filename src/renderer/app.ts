@@ -1322,7 +1322,8 @@ async function run(operation: () => Promise<unknown>): Promise<void> {
 
 function showToast(message: string): void {
   const toast = requiredElement("toast");
-  toast.textContent = message;
+  // Electron prefixes errors from the main process with the IPC channel name.
+  toast.textContent = message.replace(/^Error invoking remote method '[^']*': (?:\w*Error: )?/, "");
   toast.classList.add("visible");
   if (toastTimer) clearTimeout(toastTimer);
   toastTimer = setTimeout(() => toast.classList.remove("visible"), 4_500);

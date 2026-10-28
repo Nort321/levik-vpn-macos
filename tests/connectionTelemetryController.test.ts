@@ -38,7 +38,10 @@ vi.mock("../src/main/macos/protection", () => ({
   },
 }));
 vi.mock("../src/main/macos/networkType", () => ({ defaultRouteNetworkType: vi.fn(async () => "wifi") }));
-vi.mock("../src/main/vpn/serverPinger", () => ({ measureServerLatencies: vi.fn(async () => ({})) }));
+vi.mock("../src/main/vpn/serverPinger", () => ({
+  measureServerLatencies: vi.fn(async () => ({})),
+  extractServerEndpoint: () => null,
+}));
 vi.mock("../src/main/vpn/xrayConfig", () => ({ buildXrayConfig: () => ({}) }));
 vi.mock("../src/main/vpn/xrayManager", () => ({
   XrayManager: class XrayManager extends EventEmitter {
@@ -86,7 +89,7 @@ describe("macOS connection telemetry", () => {
     await rm(directory, { recursive: true, force: true });
   });
 
-  async function setup(settings: { autoReconnect?: boolean } = {}) {
+  async function setup(settings: { autoReconnect?: boolean; automaticServer?: boolean } = {}) {
     const controller = new AppController();
     const xray = Reflect.get(controller, "xray") as FakeXray;
     const http = {
@@ -164,5 +167,39 @@ describe("macOS connection telemetry", () => {
     expect(current()).toBe(session);
     const attempts = session!.snapshot().timeline.filter((event) => event.e === "attempt");
     expect(attempts.map((event) => event.cause)).toEqual(["initial", "server_switch"]);
+  });
+
+  it("an automatic connection tries the next server when one does not carry traffic", async () => {
+    const { controller, xray, current } = await setup({ automaticServer: true });
+    Reflect.set(controller, "latenciesMeasuredAt", Date.now());
+    Reflect.set(controller, "protocolHistory", {
+      networkKey: () => "0123456789abcdef", current: () => ({ networks: [], winners: {} }), localSalt: () => "salt", update: vi.fn(async () => undefined),
+    });
+    const refreshLiveLoad = vi.spyOn(controller as unknown as { refreshLiveLoad: () => Promise<void> }, "refreshLiveLoad").mockResolvedValue();
+    xray.start.mockRejectedValueOnce(new Error("VPN-сервер не передаёт данные. Выберите другой сервер."));
+    await controller.connect();
+    const session = current()!;
+
+    expect(refreshLiveLoad).toHaveBeenCalled();
+    expect(controller.snapshot()).toMatchObject({ status: "connected", selectedServerId: second.id });
+    const timeline = session.snapshot().timeline;
+    expect(timeline.map((event) => event.e)).toEqual(["attempt", "attempt_failed", "attempt", "connected"]);
+    expect(timeline[2]).toMatchObject({ node: "Frankfurt", cause: "failover" });
+    const history = Reflect.get(controller, "protocolHistory") as { update: ReturnType<typeof vi.fn> };
+    expect(history.update).toHaveBeenCalledOnce();
+  });
+
+  it("does not try other servers when the computer has no network or the server was chosen by hand", async () => {
+    const { controller, xray } = await setup({ automaticServer: true });
+    Reflect.set(controller, "latenciesMeasuredAt", Date.now());
+    vi.spyOn(controller as unknown as { refreshLiveLoad: () => Promise<void> }, "refreshLiveLoad").mockResolvedValue();
+    xray.start.mockRejectedValueOnce(new Error("Не найден исходящий сетевой интерфейс"));
+    await expect(controller.connect()).rejects.toThrow("исходящий");
+    expect(xray.start).toHaveBeenCalledOnce();
+
+    await controller.updateSettings({ automaticServer: false });
+    xray.start.mockRejectedValueOnce(new Error("VPN-сервер не передаёт данные. Выберите другой сервер."));
+    await expect(controller.connect()).rejects.toThrow("не передаёт");
+    expect(xray.start).toHaveBeenCalledTimes(2);
   });
 });

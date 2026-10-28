@@ -340,3 +340,23 @@ describe("AppController account rules", () => {
     expect(now).toHaveBeenCalledTimes(2);
   });
 });
+
+describe("AppController server pings", () => {
+  it("keeps the last direct pings while the tunnel would answer them itself", async () => {
+    const controller = new AppController();
+    controller.cancelLogin();
+    const running = { value: true };
+    Reflect.set(controller, "xray", { isRunning: () => running.value, setSuspended: vi.fn() });
+    const refreshLiveLoad = vi.spyOn(controller as unknown as { refreshLiveLoad: () => Promise<void> }, "refreshLiveLoad").mockResolvedValue();
+    const state = Reflect.get(controller, "state") as Record<string, unknown>;
+    Object.assign(state, {
+      servers: [{ id: "de1", tag: "de1", name: "DE1", countryCode: "DE", outbound: { protocol: "vless", settings: { vnext: [{ address: "192.0.2.1", port: 9 }] } } }],
+      serverLatencies: { de1: 48 },
+    });
+
+    await controller.pingServers();
+
+    expect(refreshLiveLoad).toHaveBeenCalled();
+    expect(controller.snapshot().serverLatencies).toEqual({ de1: 48 });
+  });
+});

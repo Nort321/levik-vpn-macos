@@ -172,7 +172,7 @@ export function buildLockdownConfig(settings: AppSettings): Record<string, unkno
   };
 }
 
-function tunInbound(dnsServer: string): Record<string, unknown> {
+export function tunInbound(dnsServer: string): Record<string, unknown> {
   return {
     tag: "levik-tun-in",
     protocol: "tun",

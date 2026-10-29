@@ -1,3 +1,4 @@
+import { open } from "node:fs/promises";
 import { clipboard, dialog, ipcMain, shell } from "electron";
 import type { BrowserWindow } from "electron";
 import { IPC, isDiagnosisAction } from "../shared/contracts";
@@ -43,6 +44,28 @@ export function registerIpc(controller: AppController, window: BrowserWindow): v
   ipcMain.handle(IPC.selectAutomatic, () => controller.selectAutomatic());
   ipcMain.handle(IPC.connect, () => controller.connect());
   ipcMain.handle(IPC.disconnect, () => controller.disconnect());
+  ipcMain.handle(IPC.connectGuest, (_event, invite: unknown) => {
+    if (typeof invite !== "string" || invite.length > 2200) throw new Error("Некорректное гостевое приглашение");
+    return controller.connectGuest(invite);
+  });
+  ipcMain.handle(IPC.disconnectGuest, () => controller.disconnectGuest());
+  ipcMain.handle(IPC.importGuestInvite, async () => {
+    const result = await dialog.showOpenDialog(window, {
+      title: "Выберите гостевое приглашение с телефона", buttonLabel: "Подключиться",
+      properties: ["openFile", "dontAddToRecent"], filters: [{ name: "Приглашение Levik", extensions: ["txt", "levik"] }],
+    });
+    if (result.canceled || !result.filePaths[0]) return;
+    const file = await open(result.filePaths[0], "r");
+    try {
+      const info = await file.stat();
+      if (!info.isFile() || info.size > 4096) throw new Error("Файл приглашения слишком большой");
+      const bytes = Buffer.alloc(4097);
+      const read = await file.read(bytes, 0, bytes.length, 0);
+      if (read.bytesRead > 4096) throw new Error("Файл приглашения слишком большой");
+      try { await controller.connectGuest(bytes.subarray(0, read.bytesRead).toString("utf8").trim()); }
+      finally { bytes.fill(0); }
+    } finally { await file.close(); }
+  });
   ipcMain.handle(IPC.updateSettings, (_event, patch: unknown) => {
     if (!isSettingsPatch(patch)) throw new Error("Некорректные настройки");
     return controller.updateSettings(patch);

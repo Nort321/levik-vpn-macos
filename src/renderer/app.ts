@@ -1,3 +1,4 @@
+import { renderGuestScreen } from "./guest";
 import type { AppSettings, AppSnapshot, AppTab, DiagnosisAction, DiagnosisSummary, TunnelServer, MacApplication, PendingApproval } from "../shared/contracts";
 import { isDiagnosisAction } from "../shared/contracts";
 import { activeVariant, countryName, groupByCountry, serverProtocolShortLabel, type CountryGroup, type CountryServer } from "../shared/serverGroups";
@@ -12,6 +13,7 @@ import { dropAmountText, dropDeviceStatus, dropFilesText, dropPercent, mountDrop
 const SUPPORT_CHAT_URL = "https://t.me/leviksupportbot";
 
 let state: AppSnapshot | null = null;
+let guestScreenOpen = false;
 let activeTab: AppTab = "home";
 let loginWaiting = false;
 /** The main process reported this sign-in as pending; when it stops, the attempt is over. */
@@ -118,6 +120,10 @@ function render(preserveScroll = true): void {
   document.documentElement.dataset.theme = state.settings.theme;
   renderedSnapshotKey = snapshotRenderKey(state);
   dropUi.update();
+  if (state.guest || guestScreenOpen) {
+    renderGuestScreen(root, state, "macos", run, () => { guestScreenOpen = false; render(); });
+    return;
+  }
   if (shouldShowLogin(state)) {
     renderLogin();
     return;
@@ -187,9 +193,11 @@ function renderLogin(): void {
         ${loginWaiting ? renderLoginMatch() : ""}
         ${loginWaiting && authorizationUri ? `<button class="button compact login-secondary" id="reopen-login-button">${icon("external")} ${approvalRequested ? "Подтвердить в браузере" : "Повторно открыть подтверждение"}</button>` : ""}
         ${!loginWaiting ? `<button class="button login-secondary" id="qr-login-button">${icon("qr")} Вход по QR-коду</button>` : ""}`}
+        <button class="button login-secondary" id="guest-open" ${state?.busy || loginWaiting ? "disabled" : ""}>Получить интернет от телефона</button>
         <div class="login-status">${escapeHtml(state?.statusDetail ?? (loginWaiting && !authorizationMatch ? "Завершите вход в открывшемся браузере" : ""))}</div>
       </section>
     </main>`;
+  document.getElementById("guest-open")?.addEventListener("click", openGuestScreen);
   document.getElementById("telegram-login-button")?.addEventListener("click", () => {
     if (authorizationTelegramUri) void run(() => window.levik.openExternal(authorizationTelegramUri as string));
   });
@@ -205,6 +213,8 @@ function renderLogin(): void {
     if (uri) void run(() => window.levik.openExternal(uri));
   });
 }
+
+function openGuestScreen(): void { guestScreenOpen = true; render(); }
 
 function renderPage(): string {
   switch (activeTab) {
@@ -223,7 +233,7 @@ function renderHome(): string {
   const disconnectAction = connected || cancellableProbe || (state.status === "error" && state.settings.killSwitch);
   const server = selectedServer();
   return `
-    <header class="page-header"><div><h1>Главная</h1><div class="subtitle">Защищённый доступ к интернету</div></div></header>
+    <header class="page-header"><div><h1>Главная</h1><div class="subtitle">Защищённый доступ к интернету</div></div><button class="button" id="guest-open" ${state.busy ? "disabled" : ""}>Интернет от телефона</button></header>
     <div class="home-grid">
       <section class="connection-card card">
         <div class="connection-label">Состояние соединения</div>
@@ -925,6 +935,7 @@ function bindCommonEvents(): void {
 }
 
 function bindPageEvents(): void {
+  document.getElementById("guest-open")?.addEventListener("click", openGuestScreen);
   document.getElementById("power-button")?.addEventListener("click", () => run(() => state?.smartAutoProbing === true || state?.status === "connected" || (state?.status === "error" && state.settings.killSwitch) ? window.levik.disconnect() : window.levik.connect()));
   document.getElementById("home-server-select")?.addEventListener("change", (event) => {
     const serverId = (event.target as HTMLSelectElement).value;

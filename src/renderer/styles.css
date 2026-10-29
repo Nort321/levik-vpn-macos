@@ -616,3 +616,18 @@ h1 { font-size: 25px; }
 .drop-overlay { padding: 16px; }
 .drop-zone { padding: 24px 18px; }
 .drop-zone-devices { grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); }
+
+/* Phone sharing: a readable offline setup guide and a separate guest session. */
+.guest-page { align-items: flex-start; overflow-y: auto; padding-block: 32px; }
+.guest-card { width: min(720px, 100%); padding: 28px; text-align: left; }
+.guest-card h1 { margin-top: 0; }
+.guest-card p, .guest-steps { line-height: 1.6; }
+.guest-steps { padding-left: 24px; }
+.guest-steps li + li { margin-top: 10px; }
+.guest-input-label { display: block; margin-bottom: 8px; font-weight: 600; }
+.guest-invite { width: 100%; box-sizing: border-box; resize: vertical; font: inherit; color: inherit; background: transparent; border: 1px solid var(--border); border-radius: 10px; padding: 12px; overflow-wrap: anywhere; }
+.guest-invite:focus-visible, .guest-proxy-help summary:focus-visible { outline: 2px solid var(--accent, #3478f6); outline-offset: 3px; }
+.guest-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.guest-hint { font-size: 13px; opacity: .8; }
+.guest-proxy-help { margin-top: 24px; padding-top: 18px; border-top: 1px solid var(--border); }
+.guest-proxy-help summary { cursor: pointer; font-weight: 600; line-height: 1.5; }

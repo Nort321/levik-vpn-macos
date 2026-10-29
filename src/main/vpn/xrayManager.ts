@@ -33,7 +33,7 @@ export class XrayManager extends EventEmitter<XrayEvents> {
   private healthFailures = 0;
   private suspended = false;
 
-  async start(config: Record<string, unknown>, tuic?: TuicEndpoint): Promise<void> {
+  async start(config: Record<string, unknown>, tuic?: TuicEndpoint, guestHost?: string): Promise<void> {
     this.stopping = true;
     this.serviceRoutes.stop();
     this.stopStatsPolling();
@@ -45,6 +45,7 @@ export class XrayManager extends EventEmitter<XrayEvents> {
       dnsServer: dnsServerFromConfig(config),
       // The helper launches sing-box for TUIC under the same isolated group as Xray.
       ...(tuic ? { tuic } : {}),
+      ...(guestHost ? { guestHost } : {}),
     });
     this.running = true;
     this.stopping = false;

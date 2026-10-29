@@ -260,6 +260,54 @@ func hasServiceRoutes(_ config: [String: Any]) -> Bool {
     return balancers.contains { $0["tag"] as? String == "levik-service-main" }
 }
 
+/// Guest invitations name only a directly reachable private phone, never a routed public endpoint.
+func isPrivateGuestAddress(_ address: String) -> Bool {
+    let parts = address.split(separator: ".", omittingEmptySubsequences: false)
+    guard parts.count == 4 else { return false }
+    var octets: [Int] = []
+    for part in parts {
+        guard let value = Int(part), (0...255).contains(value), String(value) == part else { return false }
+        octets.append(value)
+    }
+    guard octets[3] != 0 && octets[3] != 255 else { return false }
+    return octets[0] == 10 || (octets[0] == 172 && (16...31).contains(octets[1])) || (octets[0] == 192 && octets[1] == 168)
+}
+
+/// Derive the interface from OS addresses, not from a renderer-supplied interface name.
+/// A default Ethernet route must not steal a guest connection to a phone on Wi-Fi.
+func guestOutboundInterface(_ host: String, config: [String: Any]) throws -> String {
+    guard isPrivateGuestAddress(host),
+          let outbounds = config["outbounds"] as? [[String: Any]], let first = outbounds.first,
+          first["protocol"] as? String == "shadowsocks",
+          let settings = first["settings"] as? [String: Any],
+          let servers = settings["servers"] as? [[String: Any]], servers.count == 1,
+          servers[0]["address"] as? String == host, servers[0]["method"] as? String == "aes-256-gcm" else {
+        throw HelperError("Некорректное подключение к телефону")
+    }
+    var target = in_addr()
+    guard inet_pton(AF_INET, host, &target) == 1 else { throw HelperError("Некорректный адрес телефона") }
+    var addresses: UnsafeMutablePointer<ifaddrs>?
+    guard getifaddrs(&addresses) == 0 else { throw HelperError("Не удалось найти сеть телефона") }
+    defer { freeifaddrs(addresses) }
+    var current = addresses
+    var matches = Set<String>()
+    while let entry = current {
+        defer { current = entry.pointee.ifa_next }
+        let name = String(cString: entry.pointee.ifa_name)
+        guard name.range(of: "^en[0-9]+$", options: .regularExpression) != nil,
+              entry.pointee.ifa_flags & UInt32(IFF_UP) != 0,
+              let address = entry.pointee.ifa_addr, address.pointee.sa_family == UInt8(AF_INET),
+              let mask = entry.pointee.ifa_netmask else { continue }
+        let local = UnsafeRawPointer(address).assumingMemoryBound(to: sockaddr_in.self).pointee.sin_addr.s_addr
+        let netmask = UnsafeRawPointer(mask).assumingMemoryBound(to: sockaddr_in.self).pointee.sin_addr.s_addr
+        if local != target.s_addr && netmask != 0 && (local & netmask) == (target.s_addr & netmask) { matches.insert(name) }
+    }
+    guard matches.count == 1, let result = matches.first else {
+        throw HelperError("Подключитесь к Wi-Fi телефона. Его локальная сеть не найдена или неоднозначна.")
+    }
+    return result
+}
+
 func validateConfig(_ config: [String: Any]) throws {
     try inspectJSON(config, allowServiceDNS: hasServiceRoutes(config))
     let allowed: Set<String> = ["log", "api", "dns", "inbounds", "outbounds", "routing", "policy", "stats"]
@@ -562,11 +610,11 @@ final class TunnelSession {
         return ["running": running, "killSwitch": killSwitch && enabled && rules.contains("levik-kill-switch"), "dnsProtection": dnsProtection && enabled && rules.contains("levik-dns"), "pid": child.map { Int($0.processIdentifier) } as Any? ?? NSNull(), "exitCode": exitCode.map { Int($0) } as Any? ?? NSNull()]
     }
 
-    func start(_ supplied: [String: Any], killSwitch: Bool, dns: Bool, tuic: TuicParameters?) throws {
+    func start(_ supplied: [String: Any], killSwitch: Bool, dns: Bool, tuic: TuicParameters?, guestHost: String? = nil) throws {
         try validateConfig(supplied)
         try require(try signedBundleHash() == signature, "Приложение обновилось. Перезапустите Levik VPN.")
         try stop()
-        outboundInterface = try primaryOutboundInterface()
+        outboundInterface = try guestHost.map { try guestOutboundInterface($0, config: supplied) } ?? primaryOutboundInterface()
         var config = supplied
         // Any failure before the session is reported running must not leave the sidecar behind.
         var sidecarCommitted = false
@@ -950,7 +998,8 @@ func serve(parent: pid_t) throws {
                         guard let config = object["config"] as? [String: Any], let killSwitch = object["killSwitch"] as? Bool, let dns = object["dnsProtection"] as? Bool else { throw HelperError("Некорректный VPN-профиль") }
                         if let dnsServer = object["dnsServer"] as? String { try require(isIP(dnsServer), "Некорректный DNS"); session.dnsServer = dnsServer }
                         let tuic = try object["tuic"].map(parseTuicParameters)
-                        try session.start(config, killSwitch: killSwitch, dns: dns, tuic: tuic)
+                        if object["guestHost"] != nil && !(object["guestHost"] is String) { throw HelperError("Некорректный адрес телефона") }
+                        try session.start(config, killSwitch: killSwitch, dns: dns, tuic: tuic, guestHost: object["guestHost"] as? String)
                     case "stop": try session.stop()
                     case "protection":
                         guard let killSwitch = object["killSwitch"] as? Bool, let dns = object["dnsProtection"] as? Bool else { throw HelperError("Некорректные параметры защиты") }
@@ -994,6 +1043,10 @@ func serve(parent: pid_t) throws {
 func selfTest() throws {
     let config: [String: Any] = ["inbounds": [["protocol": "tun", "tag": "levik-tun-in"]], "outbounds": [["protocol": "freedom"]]]
     try validateConfig(config)
+    try require(isPrivateGuestAddress("192.168.43.1") && isPrivateGuestAddress("172.16.1.1") && isPrivateGuestAddress("10.1.2.3"), "Guest private address regression")
+    for invalid in ["127.0.0.1", "169.254.1.1", "8.8.8.8", "192.168.1.1/path", "192.168.01.1", "172.32.1.1"] {
+        try require(!isPrivateGuestAddress(invalid), "Guest address boundary regression")
+    }
     var dohConfig = config
     dohConfig["dns"] = ["servers": [["address": "https://1.1.1.1/dns-query", "skipFallback": false], "1.1.1.1"]]
     try validateConfig(dohConfig)

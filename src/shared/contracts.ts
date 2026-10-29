@@ -1,3 +1,4 @@
+import type { GuestSnapshot } from "./sharing";
 import type { ServiceRouteStatus } from "./serviceRoutes";
 import type { DropAnswer, DropControl, DropSnapshot } from "./drop";
 import type { RemoteCommand, RemoteSnapshot } from "./remote";
@@ -135,6 +136,7 @@ export interface AppSettings {
 }
 
 export interface AppSnapshot {
+  guest?: GuestSnapshot | null;
   serviceRoutes?: ServiceRouteStatus | null;
   serviceRouteNotice?: string | null;
   serviceRouteDetails?: Array<{ label: string; state: "active" | "fallback" | "blocked" | "unavailable"; exitName: string }>;
@@ -238,6 +240,9 @@ export interface LevikDesktopApi {
   selectAutomatic(): Promise<void>;
   connect(): Promise<void>;
   disconnect(): Promise<void>;
+  connectGuest(invite: string): Promise<void>;
+  disconnectGuest(): Promise<void>;
+  importGuestInvite(): Promise<void>;
   updateSettings(patch: Partial<AppSettings>): Promise<void>;
   openExternal(url: string): Promise<void>;
   listProcesses(): Promise<MacApplication[]>;
@@ -295,6 +300,9 @@ export const IPC = {
   selectAutomatic: "levik:select-automatic",
   connect: "levik:connect",
   disconnect: "levik:disconnect",
+  connectGuest: "levik:guest-connect",
+  disconnectGuest: "levik:guest-disconnect",
+  importGuestInvite: "levik:guest-import",
   updateSettings: "levik:update-settings",
   openExternal: "levik:open-external",
   listProcesses: "levik:list-processes",

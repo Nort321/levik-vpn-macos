@@ -211,7 +211,7 @@ describe("macOS tunnel profile", () => {
     const outbounds = config.outbounds as Array<Record<string, unknown>>;
     const inbounds = config.inbounds as Array<Record<string, unknown>>;
     const routing = config.routing as { rules: Array<Record<string, unknown>> };
-    expect(config.api).toEqual(expect.objectContaining({ services: ["StatsService"] }));
+    expect(config.api).toEqual(expect.objectContaining({ services: ["StatsService", "RoutingService"] }));
     expect(outbounds.some((outbound) => outbound.tag === "levik-fragment")).toBe(true);
     expect(routing.rules).toContainEqual(expect.objectContaining({ process: ["/Applications/Google Chrome.app/"], outboundTag: "levik-direct" }));
     expect(routing.rules).toContainEqual(expect.objectContaining({ ip: ["geoip:ru"], outboundTag: "levik-direct" }));

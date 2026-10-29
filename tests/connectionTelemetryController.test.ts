@@ -46,6 +46,14 @@ vi.mock("../src/main/vpn/xrayConfig", () => ({ buildXrayConfig: () => ({}) }));
 vi.mock("../src/main/vpn/xrayManager", () => ({
   XrayManager: class XrayManager extends EventEmitter {
     running = false;
+    serviceRoutes = {
+      configureSmartAuto: vi.fn(),
+      active: false,
+      smartAutoActive: false,
+      policyActive: false,
+      mainServerId: null,
+      mainExitId: null,
+    };
     start = vi.fn(async () => { this.running = true; });
     stop = vi.fn(async () => { this.running = false; });
     isRunning = () => this.running;

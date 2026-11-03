@@ -1532,8 +1532,14 @@ export class AppController extends EventEmitter<AppControllerEvents> {
       if (this.profile !== profile || this.accessToken !== token) return false;
       this.serviceRouteState.propose(profile.subscriptionId, policy);
       this.xray.serviceRoutes?.setPolicySuspended(false);
-      if (previous?.fingerprint === policy.fingerprint) this.xray.serviceRoutes?.acknowledgeRevision(policy);
-      return previous?.fingerprint !== policy.fingerprint;
+      // The live-events stream reopens every 14 minutes and each "ready" asks
+      // again. A policy the running core already carries is not a change, even
+      // when it was never acknowledged (Smart Auto without rules stays pending):
+      // restarting for it dropped every connection.
+      const running = this.lastConfig ? compiledServiceRoutes(this.lastConfig)?.policy : undefined;
+      const current = previous?.fingerprint === policy.fingerprint || running?.fingerprint === policy.fingerprint;
+      if (current) this.xray.serviceRoutes?.acknowledgeRevision(policy);
+      return !current;
     } catch {
       if (this.profile !== profile || this.accessToken !== token) return false;
       this.patch({ serviceRouteNotice: previous

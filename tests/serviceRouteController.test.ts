@@ -4,7 +4,7 @@ vi.mock("../src/main/update/appUpdater", () => ({ AppUpdater: class { on(): this
 import { AppController } from "../src/main/appController";
 import { ServiceRouteState } from "../src/main/vpn/serviceRouteState";
 import { prepareTunnelProfile } from "../src/main/vpn/tunnelProfile";
-import type { ServiceRoutePolicy, ServiceRouteStatus } from "../src/main/vpn/serviceRoutes";
+import { compiledServiceRoutes, withServiceRoutes, type ServiceRoutePolicy, type ServiceRouteStatus } from "../src/main/vpn/serviceRoutes";
 
 const policy: ServiceRoutePolicy = { version: 1, revision: 1, fingerprint: "a".repeat(64), rules: [{ id: "rule", label: "Рабочий сервис", source: "domain",
   domains: ["full:work.example"], route: { kind: "country", countryCode: "DE" }, fallback: { kind: "block" } }],
@@ -94,5 +94,22 @@ describe("service policy lifecycle", () => {
     const event = Reflect.get(controller, "applyServiceRoutes") as () => Promise<void>;
     await event.call(controller); expect(apply).not.toHaveBeenCalled();
     state.busy = false; await vi.advanceTimersByTimeAsync(1000); expect(apply).toHaveBeenCalledOnce();
+  });
+  it("does not restart for a repeated policy the running core already carries", async () => {
+    // Smart Auto without rules: the policy is installed but was never acknowledged as good.
+    const { controller, profile, cache } = await fixture(); await cache.clear(); delete profile.serviceRoutes;
+    const ruleless: ServiceRoutePolicy = { ...policy, revision: 3, fingerprint: "c".repeat(64), rules: [] };
+    const selected = profile.servers[0]!;
+    const running = withServiceRoutes({ api: { tag: "levik-api", services: ["StatsService"] }, dns: { tag: "levik-dns", servers: ["1.1.1.1"] },
+      inbounds: [], outbounds: [selected.outbound], routing: { rules: [] } },
+      { policy: ruleless, selected, servers: profile.servers, automaticServer: true, directTag: "direct", prepareOutbound: (server) => server.outbound });
+    expect(compiledServiceRoutes(running)?.status.state).toBe("applied");
+    Reflect.set(controller, "lastConfig", running);
+    Reflect.set(controller, "remoteStored", { config: { flags: { service_routes: { enabled: true, rolloutPercent: 100 } } } });
+    Reflect.set(controller, "api", { serviceRouteProfile: vi.fn(async () => ({ ok: true, applicable: true, profile: ruleless })) });
+    Reflect.get(controller, "xray").serviceRoutes.acknowledgeRevision = vi.fn();
+    const refresh = Reflect.get(controller, "refreshServiceRoutePolicy") as (server: typeof profile.servers[number]) => Promise<boolean>;
+    expect(await refresh.call(controller, selected)).toBe(false);
+    expect(await refresh.call(controller, selected)).toBe(false);
   });
 });

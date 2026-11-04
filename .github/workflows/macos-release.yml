@@ -65,6 +65,8 @@ jobs:
       - run: npm run lint
       - run: npm run build
       - run: npm test
+        env:
+          LEVIK_TEST_CORE: ${{ github.workspace }}/vendor/levik-core/darwin-${{ matrix.arch }}/levik_core.node
       - name: Prepare Apple notarization
         if: env.CSC_LINK != ''
         shell: bash
@@ -88,6 +90,7 @@ jobs:
           set -euo pipefail
           bundle=$(find release -maxdepth 2 -name 'Levik VPN.app' -print -quit)
           codesign --verify --deep --strict --verbose=2 "$bundle"
+          ELECTRON_RUN_AS_NODE=1 "$bundle/Contents/MacOS/Levik VPN" scripts/smoke-bundled-core.cjs "$bundle/Contents/Resources/levik-core/levik_core.node" "0.5.0"
           "$bundle/Contents/Resources/native/levik-helper" --self-test
           "$bundle/Contents/Resources/xray/xray" version
           "$bundle/Contents/Resources/singbox/sing-box" version

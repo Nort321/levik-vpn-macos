@@ -18,7 +18,34 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  core:
+    name: Fetch pinned Rust module
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # No checkout or application/dependency code runs with this write token.
+      - name: Read own-repository draft assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p core-input/darwin-arm64
+          gh api "repos/$GITHUB_REPOSITORY/releases/assets/711070449" -H "Accept: application/octet-stream" > core-input/darwin-arm64/levik_core.node
+          printf '%s\n' '322e7ea1b90eea157438dd12336d41d0a3a6d68c3f0492247ff6aa2a4275064c  core-input/darwin-arm64/levik_core.node' | sha256sum --check
+          mkdir -p core-input/darwin-x64
+          gh api "repos/$GITHUB_REPOSITORY/releases/assets/711070443" -H "Accept: application/octet-stream" > core-input/darwin-x64/levik_core.node
+          printf '%s\n' '6fceb1699d5f186f53705bcf746acff1a033cce33cc88549c136886195f8aec0  core-input/darwin-x64/levik_core.node' | sha256sum --check
+      - uses: actions/upload-artifact@v4
+        with:
+          name: levik-core-pinned
+          path: core-input/
+          if-no-files-found: error
+          retention-days: 1
   build:
+    needs: core
+    if: ${{ always() && (needs.core.result == 'success' || (github.event_name == 'pull_request' && needs.core.result == 'skipped')) }}
     strategy:
       fail-fast: false
       matrix:
@@ -59,14 +86,22 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
       - run: npm run download:xray
       - run: npm run download:singbox
-      - run: npm run download:levik-core
-        env:
-          LEVIK_CORE_TOKEN: ${{ secrets.LEVIK_CORE_TOKEN }}
+      - uses: actions/download-artifact@v4
+        if: needs.core.result == 'success'
+        with:
+          name: levik-core-pinned
+          path: vendor/levik-core
+      - name: Verify pinned Rust module
+        if: needs.core.result == 'success'
+        run: npm run download:levik-core -- --verify-local
+      - name: Optional Rust module for pull requests
+        if: needs.core.result == 'skipped'
+        run: npm run download:levik-core
       - run: npm run lint
       - run: npm run build
       - run: npm test
         env:
-          LEVIK_TEST_CORE: ${{ github.workspace }}/vendor/levik-core/darwin-${{ matrix.arch }}/levik_core.node
+          LEVIK_TEST_CORE: ${{ needs.core.result == 'success' && format('{0}/vendor/levik-core/darwin-{1}/levik_core.node', github.workspace, matrix.arch) || '' }}
       - name: Prepare Apple notarization
         if: env.CSC_LINK != ''
         shell: bash
@@ -90,7 +125,9 @@ jobs:
           set -euo pipefail
           bundle=$(find release -maxdepth 2 -name 'Levik VPN.app' -print -quit)
           codesign --verify --deep --strict --verbose=2 "$bundle"
-          ELECTRON_RUN_AS_NODE=1 "$bundle/Contents/MacOS/Levik VPN" scripts/smoke-bundled-core.cjs "$bundle/Contents/Resources/levik-core/levik_core.node" "0.5.0"
+          if [[ "${{ needs.core.result }}" == "success" ]]; then
+            ELECTRON_RUN_AS_NODE=1 "$bundle/Contents/MacOS/Levik VPN" scripts/smoke-bundled-core.cjs "$bundle/Contents/Resources/levik-core/levik_core.node" "0.6.0"
+          fi
           "$bundle/Contents/Resources/native/levik-helper" --self-test
           "$bundle/Contents/Resources/xray/xray" version
           "$bundle/Contents/Resources/singbox/sing-box" version

@@ -7,6 +7,8 @@ import { buildXrayConfigWithCore } from "../src/main/core/coreXray";
 import { countryServersWithCore } from "../src/main/core/coreServers";
 import { reconcileFavoritesWithCore, unionNodeListsWithCore } from "../src/main/core/coreFavorites";
 import { expiryNoticesWithCore, parseAccountNoticesWithCore } from "../src/main/core/coreNotices";
+import { helperStartFailureWithCore } from "../src/main/core/coreTelemetry";
+import { helperStartFailure } from "../src/main/telemetry/codes";
 import { parseDeliveredCommandsWithCore, parseIssuedCommandsWithCore, parseRemoteDevicesWithCore } from "../src/main/core/coreRemote";
 import { parseIssuedCommands } from "../src/main/platform/remoteCommands";
 import { parseAccountNotices } from "../src/main/platform/accountNotices";
@@ -528,6 +530,23 @@ describe("the remote through the core", () => {
   });
 });
 
+const HELPER_MESSAGES = ["VPN-туннель не передаёт данные", "не передаёт данные: сервер отклонил соединение", "не передаёт данные: СЕРТИФИКАТ",
+  "не передаёт данные: DNS", "Разрешение macOS не получено", "Некорректный VPN-профиль", "Некорректный\ufeffVPN-профиль", "ПОМОЩНИК", "что-то другое"];
+
+describe("telemetry codes through the core", () => {
+  it("asks nothing in ts mode, and uses a known stage from Rust in rust mode only", () => {
+    const bridge = fakeBridge({ "telemetryCodes.helperStartFailure": () => null });
+    expect(helperStartFailureWithCore(new RustCore(bridge, () => {}, "ts"), "ПОМОЩНИК")).toEqual(["tun", "helper_failed"]);
+    expect(bridge.calls).toEqual([]);
+    const answers: unknown[] = [["core", "core_start_failed"], ["launch", "x"], ["tun", "Bad Code"]];
+    const core = new RustCore(fakeBridge({ "telemetryCodes.helperStartFailure": () => answers.shift() }), () => {}, "rust");
+    expect(helperStartFailureWithCore(core, "x")).toEqual(["core", "core_start_failed"]);
+    expect(helperStartFailureWithCore(core, "x")).toBeNull();
+    expect(helperStartFailureWithCore(core, "x")).toBeNull();
+    expect(core.stats()).toMatchObject({ decided: 1, failed: 2 });
+  });
+});
+
 // The real module, when `npm run download:levik-core` (or a local build) put it into vendor.
 const status = loadLevikCore(levikCorePath({ packaged: false, resourcesPath: "", appPath: join(__dirname, "..") }));
 const bridge = coreBridge(status);
@@ -706,5 +725,14 @@ describe.runIf(bridge !== null)("the Rust core in shadow mode agrees with TypeSc
     expect(lines).toEqual([]);
     expect(core.stats()).toMatchObject({ differed: 0, failed: 0 });
     expect(core.stats().compared - before).toBe(RAW_DELIVERED.length + RAW_DEVICES.length + RAW_ISSUED.length - 3);
+  });
+
+  it("telemetry codes", () => {
+    expect(core.has("telemetryCodes.helperStartFailure")).toBe(true);
+    const before = core.stats().compared;
+    for (const message of HELPER_MESSAGES) expect(helperStartFailureWithCore(core, message)).toEqual(helperStartFailure(message));
+    expect(lines).toEqual([]);
+    expect(core.stats()).toMatchObject({ differed: 0, failed: 0 });
+    expect(core.stats().compared - before).toBe(HELPER_MESSAGES.length);
   });
 });

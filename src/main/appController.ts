@@ -72,7 +72,8 @@ import { isIP } from "node:net";
 import { join } from "node:path";
 import { AppUpdater } from "./update/appUpdater";
 import { defaultRouteNetworkType } from "./macos/networkType";
-import { helperStartFailure, protocolOf } from "./telemetry/codes";
+import { protocolOf } from "./telemetry/codes";
+import { helperStartFailureWithCore } from "./core/coreTelemetry";
 import { ConnectionTelemetry } from "./telemetry/connectionTelemetry";
 import { DiskLog } from "./diagnostics/diskLog";
 import { createSupportNote, MAX_SUPPORT_NOTE_BYTES, supportNoteText } from "./diagnostics/supportNote";
@@ -825,7 +826,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
    */
   private async automaticConnectFallback(server: TunnelServer, error: unknown, failed: ReadonlySet<string>): Promise<TunnelServer | null> {
     if (!this.state.settings.automaticServer || this.systemAsleep || failed.size >= MAX_AUTOMATIC_CONNECT_SERVERS) return null;
-    const failure = error instanceof Error ? helperStartFailure(error.message) : null;
+    const failure = error instanceof Error ? helperStartFailureWithCore(this.core, error.message) : null;
     if (!failure || !["verify", "handshake"].includes(failure[0]) || failure[1] === "unreachable") return null;
     const network = this.currentNetworkKey();
     if (network) {
@@ -3057,7 +3058,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
       reach: (nextStage, nextCode) => { stage = nextStage; code = nextCode; },
       fail: (error) => {
         // The helper names the failed step more precisely than the app's progress.
-        const failure = error instanceof Error ? helperStartFailure(error.message) : null;
+        const failure = error instanceof Error ? helperStartFailureWithCore(this.core, error.message) : null;
         if (failure) [stage, code] = failure;
         this.telemetry.record((session) => session.attemptFailed(stage, code));
       },

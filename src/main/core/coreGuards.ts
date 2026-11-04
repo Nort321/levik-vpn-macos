@@ -9,6 +9,7 @@ import { isCanonicalNodeList } from "../platform/favoriteNodes";
 import type { AccountNotice } from "../platform/accountNotices";
 import { isCabinetTarget } from "../platform/links";
 import type { ExpiryNotice } from "../platform/notices";
+import type { AttemptStage } from "../telemetry/sessionRecorder";
 import type { DeliveredCommand } from "../platform/remoteCommands";
 import { isRemoteCommand, type IssuedCommand, type RemoteDevice } from "../../shared/remote";
 
@@ -259,4 +260,12 @@ export function isIssuedCommandList(value: unknown): value is IssuedCommand[] {
     && (item.state === "pending" || item.state === "delivered" || item.state === "done" || item.state === "failed"
       || item.state === "unsupported" || item.state === "expired")
     && isStringOrNullUpTo(item.detail, 1000));
+}
+
+const ATTEMPT_STAGES: ReadonlySet<string> = new Set(["profile", "core", "tun", "handshake", "verify"]);
+
+/** A stage and a code (docs/connection-telemetry.md), or null. */
+export function isHelperStartFailure(value: unknown): value is readonly [AttemptStage, string] | null {
+  return value === null || (Array.isArray(value) && value.length === 2 && isString(value[0]) && ATTEMPT_STAGES.has(value[0])
+    && isString(value[1]) && /^[a-z_]{1,40}$/.test(value[1]));
 }

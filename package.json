@@ -14,7 +14,8 @@
     "download:singbox": "node scripts/download-singbox.mjs",
     "package:mac": "npm run build && electron-builder --mac dmg zip --publish never",
     "check": "npm run lint && npm run build && npm test",
-    "package:local": "npm run build && electron-builder --mac dmg zip --publish never --config.mac.identity=- --config.mac.entitlements=build/entitlements.local.plist --config.mac.entitlementsInherit=build/entitlements.local.plist"
+    "package:local": "npm run build && electron-builder --mac dmg zip --publish never --config.mac.identity=- --config.mac.entitlements=build/entitlements.local.plist --config.mac.entitlementsInherit=build/entitlements.local.plist",
+    "fetch:levik-core": "node scripts/fetch-levik-core.mjs darwin-arm64 darwin-x64"
   },
   "devDependencies": {
     "@types/qrcode": "^1.5.5",
@@ -70,6 +71,13 @@
         "to": "native",
         "filter": [
           "levik-helper"
+        ]
+      },
+      {
+        "from": "vendor/levik-core/darwin-${arch}",
+        "to": "levik-core",
+        "filter": [
+          "levik_core.node"
         ]
       }
     ],

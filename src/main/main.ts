@@ -2,6 +2,7 @@ import { app, BrowserWindow, dialog, Menu, nativeImage, Notification, powerMonit
 import { join } from "node:path";
 import type { AppSnapshot, AppTab, ConnectionStatus } from "../shared/contracts";
 import { AppController } from "./appController";
+import { describeLevikCore, levikCorePath, loadLevikCore } from "./core/levikCore";
 import { openCabinet, registerIpc } from "./ipc";
 import { DEEP_LINK_SCHEME, parseDeepLink } from "./platform/links";
 import type { AppNotice } from "./platform/notices";
@@ -50,6 +51,8 @@ app.whenReady().then(async () => {
   });
   powerMonitor.on("unlock-screen", () => void controller?.restoreAfterSystemResume());
   await controller.initialize();
+  // Stage 0 of the Rust migration: only records whether the optional module loads.
+  controller.recordDiagnostic(describeLevikCore(loadLevikCore(levikCorePath({ packaged: app.isPackaged, resourcesPath: process.resourcesPath, appPath: app.getAppPath() }))));
   updateTray(controller.snapshot());
   mainWindow.show();
   started = true;

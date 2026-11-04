@@ -233,7 +233,7 @@ function renderHome(): string {
   const disconnectAction = connected || cancellableProbe || (state.status === "error" && state.settings.killSwitch);
   const server = selectedServer();
   return `
-    <header class="page-header"><div><h1>Главная</h1><div class="subtitle">Защищённый доступ к интернету</div></div><button class="button" id="guest-open" ${state.busy ? "disabled" : ""}>Интернет от телефона</button></header>
+    <header class="page-header"><div><h1>Главная</h1><div class="subtitle">Защищённый доступ к интернету</div></div></header>
     <div class="home-grid">
       <section class="connection-card card">
         <div class="connection-label">Состояние соединения</div>
@@ -425,6 +425,7 @@ function renderProfile(): string {
       ${accountSection}
       ${renderRemoteDevices()}
       ${renderDrop()}
+      ${renderGuestEntry()}
       ${renderServiceRoutes()}
       ${renderHomeRoad()}
       <section class="section card"><h2 class="card-title">Авторизовать устройство</h2><div class="card-caption">Введите код, показанный на экране другого устройства.</div><form class="activation-form" id="activation-form"><label for="activation-code">Код активации</label><div class="activation-controls"><input id="activation-code" type="text" inputmode="text" autocomplete="one-time-code" maxlength="19" placeholder="XXXX-XXXX-XXXX-XXXX" value="${escapeAttribute(activationCodeInput)}" ${activationSubmitting ? "disabled" : ""} /><button class="button primary" type="submit" ${activationSubmitting ? "disabled" : ""}>${activationSubmitting ? `<span class="spinner"></span>` : icon("link")} Авторизовать</button></div></form></section>
@@ -481,6 +482,12 @@ function subscriptionCard(subscription: NonNullable<AppSnapshot["account"]>["sub
   const limit = subscription.traffic.limitBytes;
   const percent = limit > 0 ? Math.min(100, Math.round(subscription.traffic.usedBytes / limit * 100)) : 0;
   return `<div class="subscription-wrap"><button class="subscription ${selected ? "selected" : ""}" data-subscription-id="${escapeAttribute(subscription.uuid)}"><span class="subscription-head"><span class="subscription-title">${escapeHtml(subscription.title)}</span><span class="badge">${escapeHtml(subscription.status)}</span></span><span class="progress" role="progressbar" aria-label="Использовано трафика" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}"><span class="progress-fill ${subscription.traffic.usedBytes > 0 ? "has-usage" : ""}" data-progress="${percent}"></span></span><span class="subscription-meta"><span>${formatBytes(subscription.traffic.usedBytes)} из ${limit > 0 ? formatBytes(limit) : "∞"}</span><span>${subscription.devices.used}/${subscription.devices.limit} устройств</span></span></button><div class="subscription-actions"><button class="button compact" data-devices-subscription-id="${escapeAttribute(subscription.uuid)}">${icon("devices")} Устройства</button>${subscription.shield.supported ? `<button class="button compact" data-shield-subscription-id="${escapeAttribute(subscription.uuid)}" data-shield-enabled="${subscription.shield.enabled}">${icon("shield")} Shield: ${subscription.shield.enabled ? "вкл." : "выкл."}</button>` : ""}${subscription.actions.renew ? `<button class="button compact" data-renew-subscription-id="${escapeAttribute(subscription.uuid)}">${icon("renew")} Продлить</button>` : ""}</div></div>`;
+}
+
+// Guest mode lives in Profile; the login screen keeps its own entry for people without a subscription.
+function renderGuestEntry(): string {
+  if (!state) return "";
+  return `<section class="section card" aria-labelledby="guest-entry-title"><div class="section-head"><div><h2 class="card-title" id="guest-entry-title">Интернет от телефона</h2><div class="card-caption">Подключитесь к раздаче Android-телефона с Levik VPN по приглашению владельца. Своя подписка не нужна.</div></div><button class="button" id="guest-open" ${state.busy ? "disabled" : ""}>Открыть</button></div></section>`;
 }
 
 function renderRemoteDevices(): string {

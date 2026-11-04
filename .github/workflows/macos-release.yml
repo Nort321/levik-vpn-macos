@@ -32,11 +32,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p core-input/darwin-arm64
-          gh api "repos/$GITHUB_REPOSITORY/releases/assets/711070449" -H "Accept: application/octet-stream" > core-input/darwin-arm64/levik_core.node
-          printf '%s\n' '322e7ea1b90eea157438dd12336d41d0a3a6d68c3f0492247ff6aa2a4275064c  core-input/darwin-arm64/levik_core.node' | sha256sum --check
+          gh api "repos/$GITHUB_REPOSITORY/releases/assets/711191078" -H "Accept: application/octet-stream" > core-input/darwin-arm64/levik_core.node
+          printf '%s\n' '92f4dba5159961085e42da72ea7b27445eb499d277bb862160172934b1f1d62c  core-input/darwin-arm64/levik_core.node' | sha256sum --check
           mkdir -p core-input/darwin-x64
-          gh api "repos/$GITHUB_REPOSITORY/releases/assets/711070443" -H "Accept: application/octet-stream" > core-input/darwin-x64/levik_core.node
-          printf '%s\n' '6fceb1699d5f186f53705bcf746acff1a033cce33cc88549c136886195f8aec0  core-input/darwin-x64/levik_core.node' | sha256sum --check
+          gh api "repos/$GITHUB_REPOSITORY/releases/assets/711191075" -H "Accept: application/octet-stream" > core-input/darwin-x64/levik_core.node
+          printf '%s\n' 'e46599050deea2c12e6ee6a192a0c039df4e0ec1e8838c817e3fac7461e2ca32  core-input/darwin-x64/levik_core.node' | sha256sum --check
       - uses: actions/upload-artifact@v4
         with:
           name: levik-core-pinned
@@ -126,7 +126,7 @@ jobs:
           bundle=$(find release -maxdepth 2 -name 'Levik VPN.app' -print -quit)
           codesign --verify --deep --strict --verbose=2 "$bundle"
           if [[ "${{ needs.core.result }}" == "success" ]]; then
-            ELECTRON_RUN_AS_NODE=1 "$bundle/Contents/MacOS/Levik VPN" scripts/smoke-bundled-core.cjs "$bundle/Contents/Resources/levik-core/levik_core.node" "0.6.0"
+            ELECTRON_RUN_AS_NODE=1 "$bundle/Contents/MacOS/Levik VPN" scripts/smoke-bundled-core.cjs "$bundle/Contents/Resources/levik-core/levik_core.node" "0.8.0"
           fi
           "$bundle/Contents/Resources/native/levik-helper" --self-test
           "$bundle/Contents/Resources/xray/xray" version

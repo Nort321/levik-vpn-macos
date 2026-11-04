@@ -15,7 +15,8 @@
     "package:mac": "npm run build && electron-builder --mac dmg zip --publish never",
     "check": "npm run lint && npm run build && npm test",
     "package:local": "npm run build && electron-builder --mac dmg zip --publish never --config.mac.identity=- --config.mac.entitlements=build/entitlements.local.plist --config.mac.entitlementsInherit=build/entitlements.local.plist",
-    "fetch:levik-core": "node scripts/fetch-levik-core.mjs darwin-arm64 darwin-x64"
+    "fetch:levik-core": "node scripts/fetch-levik-core.mjs darwin-arm64 darwin-x64",
+    "download:levik-core": "node scripts/download-levik-core.mjs"
   },
   "devDependencies": {
     "@types/qrcode": "^1.5.5",

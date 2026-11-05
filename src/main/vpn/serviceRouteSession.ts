@@ -1,3 +1,4 @@
+import { CoreRouteProbes, type OpenRouteProbe } from "../core/nativeRouteProbes";
 import { CoreServiceProbes, type StartServiceProbe } from "../core/nativeServiceProbes";
 import { CoreXrayApi, type StartXrayRequest } from "../core/nativeXrayApi";
 import type { RustCore } from "../core/rustCore";
@@ -19,9 +20,11 @@ export interface SmartAutoSessionHooks {
 export class ServiceRouteSession {
   private readonly xrayApi = new CoreXrayApi();
   private readonly serviceProbes = new CoreServiceProbes();
-  useRustCore(current: () => RustCore, start: StartXrayRequest | undefined, report: () => void, startProbe?: StartServiceProbe): void {
+  private readonly routeProbes = new CoreRouteProbes();
+  useRustCore(current: () => RustCore, start: StartXrayRequest | undefined, report: () => void, startProbe?: StartServiceProbe, openProbe?: OpenRouteProbe): void {
     this.xrayApi.useRustCore(current, start, report);
     this.serviceProbes.useRustCore(current, startProbe, report);
+    this.routeProbes.useRustCore(current, openProbe, report);
   }
   private overrideRoute(balancer: string, target: string, auth: ServiceRouteAuth): Promise<void> {
     return this.xrayApi.override(balancer, target, auth, () => overrideServiceRoute(balancer, target, undefined, auth));
@@ -232,7 +235,7 @@ export class ServiceRouteSession {
             open: async (_executable, candidate, childSignal) => {
               if (generation !== this.generation) throw new Error("Подключение изменилось");
               const route = byId.get(candidate.id); if (!route) throw new Error("Маршрут недоступен");
-              return await openExistingRouteProbe(route.port, auth, childSignal, { verifyData: !verified(this.bodyProofKey(route)) });
+              return await openExistingRouteProbe(route.port, auth, childSignal, { verifyData: !verified(this.bodyProofKey(route)), core: this.routeProbes });
             }, now: this.clock,
           });
           if (generation !== this.generation || signal.aborted) return {};
@@ -278,13 +281,14 @@ export class ServiceRouteSession {
   stop(): void {
     this.xrayApi.cancel();
     this.serviceProbes.cancel();
+    this.routeProbes.cancel();
     this.generation += 1;
     if (this.timer) clearInterval(this.timer);
     this.timer = null; this.automatic?.stop(); this.automatic = null; this.automaticFactory = null; this.mainContext = null;
     this.automaticRequested = false; this.automaticEpoch++; this.mainWrites = Promise.resolve(); this.mainPending = 0; this.activity.reset(); this.verifiedBodies.clear(); this.knownRouteIds.clear(); this.bodyNetwork = undefined; this.installedMainId = null; this.usingServicePolicy = false; this.runtime?.stop(); this.runtime = null; this.targets.clear(); this.status = null; this.auth = undefined; this.mainExit = null; this.policySuspended = false;
   }
   setSuspended(suspended: boolean): void {
-    if (suspended) this.serviceProbes.cancel();
+    if (suspended) { this.serviceProbes.cancel(); this.routeProbes.cancel(); }
     this.suspended = suspended; this.automatic?.setSuspended(suspended); this.activity.reset(); this.verifiedBodies.clear(); this.runtime?.setSuspended(suspended || this.policySuspended);
     if (!suspended) void this.refresh();
   }

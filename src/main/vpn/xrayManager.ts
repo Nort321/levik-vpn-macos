@@ -33,6 +33,8 @@ export class XrayManager extends EventEmitter<XrayEvents> {
   private healthFailures = 0;
   private suspended = false;
 
+  constructor(private readonly probeHealth: typeof isTunnelHealthy = isTunnelHealthy) { super(); }
+
   async start(config: Record<string, unknown>, tuic?: TuicEndpoint, guestHost?: string): Promise<void> {
     this.stopping = true;
     this.serviceRoutes.stop();
@@ -77,7 +79,7 @@ export class XrayManager extends EventEmitter<XrayEvents> {
         if (this.serviceRoutes.active) await this.serviceRoutes.queryStats();
       } else await this.statsClient.query("inbound>>>levik-tun-in>>>");
       const healthy = this.serviceRoutes.active || (this.serviceRoutes.authentication
-        ? await this.serviceRoutes.probeCurrent() : await isTunnelHealthy({ onFailure }));
+        ? await this.serviceRoutes.probeCurrent() : await this.probeHealth({ onFailure }));
       return healthy && this.running && generation === this.statsGeneration;
     } catch {
       // The core's stats API is not answering, so it is not serving traffic.

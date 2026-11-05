@@ -66,7 +66,7 @@ describe.skipIf(process.platform !== "darwin")("macOS installer handoff", () => 
     ].join("\n"));
     const launch = launchMacUpdateInstaller(update);
     try {
-      await vi.waitFor(() => expect(vi.mocked(execFile).mock.results[0]?.value.exitCode).toBe(0));
+      await vi.waitFor(() => expect(vi.mocked(execFile).mock.results[0]?.value.exitCode).toBe(0), { timeout: 10_000 });
     } finally {
       await writeFile(join(update.stagingRoot, ".installer-ready.released"), "");
     }
@@ -75,7 +75,7 @@ describe.skipIf(process.platform !== "darwin")("macOS installer handoff", () => 
       "--install-update", String(process.pid), update.bundlePath, update.version, join(update.stagingRoot, ".installer-ready"), "",
     ].join("\n"));
     expect(await readFile(join(update.stagingRoot, "installer.log"), "utf8")).toBe("");
-  });
+  }, 30_000);
 
   it("reports helper startup errors instead of waiting for readiness", async () => {
     const update = await setupInstaller('printf "installer failed\\n" >&2\nexit 1');

@@ -99,7 +99,8 @@ jobs:
         run: npm run download:levik-core
       - run: npm run lint
       - run: npm run build
-      - run: npm test
+      # Bound process contention on hosted runners with native crypto and OS fixtures.
+      - run: npm test -- --maxWorkers=2
         env:
           LEVIK_TEST_CORE: ${{ needs.core.result == 'success' && format('{0}/vendor/levik-core/darwin-{1}/levik_core.node', github.workspace, matrix.arch) || '' }}
       - name: Prepare Apple notarization

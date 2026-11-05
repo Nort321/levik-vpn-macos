@@ -1,7 +1,3 @@
-import type { OpenRouteProbe } from "../core/nativeRouteProbes";
-import type { StartServiceProbe } from "../core/nativeServiceProbes";
-import { CoreXrayApi, type StartXrayRequest } from "../core/nativeXrayApi";
-import type { RustCore } from "../core/rustCore";
 import { ServiceRouteSession } from "./serviceRouteSession";
 import type { ServiceRouteStatus } from "./serviceRoutes";
 import { app } from "electron";
@@ -25,11 +21,6 @@ interface XrayEvents {
 
 export class XrayManager extends EventEmitter<XrayEvents> {
   readonly serviceRoutes = new ServiceRouteSession((status) => this.emit("serviceRoutes", status));
-  private readonly localApi = new CoreXrayApi();
-  useRustCore(current: () => RustCore, start: StartXrayRequest | undefined, report: () => void, startProbe?: StartServiceProbe, openProbe?: OpenRouteProbe): void {
-    this.localApi.useRustCore(current, start, report);
-    this.serviceRoutes.useRustCore(current, start, report, startProbe, openProbe);
-  }
   private running = false;
   private stopping = false;
   private statsTimer: ReturnType<typeof setInterval> | null = null;
@@ -41,8 +32,6 @@ export class XrayManager extends EventEmitter<XrayEvents> {
   private healthCheckRunning = false;
   private healthFailures = 0;
   private suspended = false;
-
-  constructor(private readonly probeHealth: typeof isTunnelHealthy = isTunnelHealthy) { super(); }
 
   async start(config: Record<string, unknown>, tuic?: TuicEndpoint, guestHost?: string): Promise<void> {
     this.stopping = true;
@@ -86,11 +75,9 @@ export class XrayManager extends EventEmitter<XrayEvents> {
     try {
       if (this.serviceRoutes.authentication) {
         if (this.serviceRoutes.active) await this.serviceRoutes.queryStats();
-      } else await this.localApi.statistics(undefined, async () => ({
-        ...await this.statsClient.query("inbound>>>levik-tun-in>>>"), initialized: false,
-      }));
+      } else await this.statsClient.query("inbound>>>levik-tun-in>>>");
       const healthy = this.serviceRoutes.active || (this.serviceRoutes.authentication
-        ? await this.serviceRoutes.probeCurrent() : await this.probeHealth({ onFailure }));
+        ? await this.serviceRoutes.probeCurrent() : await isTunnelHealthy({ onFailure }));
       return healthy && this.running && generation === this.statsGeneration;
     } catch {
       // The core's stats API is not answering, so it is not serving traffic.
@@ -115,7 +102,6 @@ export class XrayManager extends EventEmitter<XrayEvents> {
   }
 
   private stopStatsPolling(): void {
-    this.localApi.cancel();
     if (this.statsTimer) clearInterval(this.statsTimer);
     this.statsTimer = null;
     if (this.healthTimer) clearInterval(this.healthTimer);
@@ -171,9 +157,7 @@ export class XrayManager extends EventEmitter<XrayEvents> {
     const generation = this.statsGeneration;
     try {
       const values = this.serviceRoutes.authentication ? await this.serviceRoutes.queryStats()
-        : await this.localApi.statistics(undefined, async () => ({
-          ...await this.statsClient.query("inbound>>>levik-tun-in>>>traffic>>>"), initialized: false,
-        }));
+        : await this.statsClient.query("inbound>>>levik-tun-in>>>traffic>>>");
       if (generation !== this.statsGeneration) return;
       this.statsErrorReported = false;
       if (this.running) this.emit("stats", values.downlink, values.uplink);

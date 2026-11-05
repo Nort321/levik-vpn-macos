@@ -32,7 +32,6 @@ export function buildXrayConfig(
   profile: PreparedTunnelProfile,
   server: TunnelServer,
   settings: AppSettings,
-  servicePassword?: string,
 ): Record<string, unknown> {
   const antiDpiOutbound = server.tuic ? server.outbound : withAntiDpi(server, settings);
   const selectedOutbound = server.tuic ? tuicLocalOutbound(server.tag) : withAlternateXhttpMux(antiDpiOutbound);
@@ -97,7 +96,7 @@ export function buildXrayConfig(
     routing: { domainStrategy: "IPIfNonMatch", domainMatcher: "hybrid", rules },
     policy: { system: { statsInboundDownlink: true, statsInboundUplink: true, statsOutboundDownlink: true, statsOutboundUplink: true } },
     stats: {},
-  }, { policy: profile.serviceRoutes, selected: server, servers: profile.servers, servicePassword,
+  }, { policy: profile.serviceRoutes, selected: server, servers: profile.servers,
     automaticServer: settings.automaticServer,
     applicationFilterUnsupported: settings.splitTunnelMode !== "off" && settings.splitTunnelProcesses.length > 0,
     ...(settings.splitTunnelMode === "only" ? { onlyProcesses: settings.splitTunnelProcesses, insertionIndex: includedAppRule ? rules.indexOf(includedAppRule) : rules.length } : {}), bootstrapEndpoints: false, directTag: "levik-direct",

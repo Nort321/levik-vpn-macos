@@ -1,7 +1,3 @@
-import { CoreRouteProbes, type OpenRouteProbe } from "../core/nativeRouteProbes";
-import { CoreServiceProbes, type StartServiceProbe } from "../core/nativeServiceProbes";
-import { CoreXrayApi, type StartXrayRequest } from "../core/nativeXrayApi";
-import type { RustCore } from "../core/rustCore";
 import { compiledServiceRoutes, SERVICE_MAIN_BALANCER, ServiceRouteRuntime, type ServiceRouteStatus, type ServiceRoutePolicy, type ServiceRouteAuth } from "./serviceRoutes";
 import { overrideServiceRoute, probeServiceRoute, probeServiceRouteDns, queryServiceRouteStatistics } from "./serviceRouteTransport";
 
@@ -18,17 +14,6 @@ export interface SmartAutoSessionHooks {
 
 /** Owns only routing API overrides; never starts/stops a core or modifies protected-mode settings. */
 export class ServiceRouteSession {
-  private readonly xrayApi = new CoreXrayApi();
-  private readonly serviceProbes = new CoreServiceProbes();
-  private readonly routeProbes = new CoreRouteProbes();
-  useRustCore(current: () => RustCore, start: StartXrayRequest | undefined, report: () => void, startProbe?: StartServiceProbe, openProbe?: OpenRouteProbe): void {
-    this.xrayApi.useRustCore(current, start, report);
-    this.serviceProbes.useRustCore(current, startProbe, report);
-    this.routeProbes.useRustCore(current, openProbe, report);
-  }
-  private overrideRoute(balancer: string, target: string, auth: ServiceRouteAuth): Promise<void> {
-    return this.xrayApi.override(balancer, target, auth, () => overrideServiceRoute(balancer, target, undefined, auth));
-  }
   private runtime: ServiceRouteRuntime | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
   private generation = 0;
@@ -69,8 +54,7 @@ export class ServiceRouteSession {
   async probeCurrent(): Promise<boolean> {
     const tag = this.targets.get(SERVICE_MAIN_BALANCER);
     const candidate = this.mainContext?.candidates.find((item) => item.tag === tag);
-    const auth = this.auth;
-    return Boolean(candidate && auth && await this.serviceProbes.transport(candidate.port, auth, () => probeServiceRoute(candidate.port, auth)));
+    return Boolean(candidate && this.auth && await probeServiceRoute(candidate.port, this.auth));
   }
   configureSmartAuto(hooks: SmartAutoSessionHooks): void { this.smartHooks = hooks; }
   /** Hot mode changes preserve the core/TUN and freeze the last acknowledged
@@ -126,7 +110,7 @@ export class ServiceRouteSession {
           || latest?.[target.id]?.routeId !== undefined && latest[target.id]!.routeId !== targetRoute
           || sourceId && latest?.[sourceId]?.routeId !== undefined && latest[sourceId]!.routeId !== sourceRoute) throw new Error("Automatic selection is protected");
       }
-      await this.overrideRoute(SERVICE_MAIN_BALANCER, tag, auth);
+      await overrideServiceRoute(SERVICE_MAIN_BALANCER, tag, undefined, auth);
       if (generation !== this.generation) throw new Error("Core changed");
       this.targets.set(SERVICE_MAIN_BALANCER, tag); this.installedMainId = target.id; this.mainExit = target.exitId ?? null;
       this.runtime?.setExternalMain(tag);
@@ -164,8 +148,7 @@ export class ServiceRouteSession {
     if (!this.auth) throw new Error("Нет активного сервисного API");
     const generation = this.generation;
     try {
-      const auth = this.auth;
-      const stats = await this.xrayApi.statistics(auth, () => queryServiceRouteStatistics(auth));
+      const stats = await queryServiceRouteStatistics(this.auth);
       if (generation !== this.generation) throw new Error("Подключение изменилось");
       if (stats.initialized) this.activity.observe(stats); else this.activity.reset();
       return { uplink: stats.uplink, downlink: stats.downlink };
@@ -184,13 +167,13 @@ export class ServiceRouteSession {
     this.usingServicePolicy = compiled.policyActive ?? true;
     const ports = new Map(compiled.probes.map((probe) => [probe.tag, probe.port]));
     this.runtime = new ServiceRouteRuntime(compiled.plans,
-      async (tag) => { const port = ports.get(tag); return port !== undefined && await this.serviceProbes.transport(port, auth, () => probeServiceRoute(port, auth)); },
+      async (tag) => { const port = ports.get(tag); return port !== undefined && await probeServiceRoute(port, auth); },
       async (balancer, target) => {
         if (generation !== this.generation) return;
         // __main belongs only to SmartAuto when present; service rules retain
         // their own health/DNS owner and cannot overwrite ordinary selection.
         if (compiled.automatic && balancer === SERVICE_MAIN_BALANCER) throw new Error("Automatic main has a dedicated owner");
-        await this.overrideRoute(balancer, target, auth);
+        await overrideServiceRoute(balancer, target, undefined, auth);
         if (generation === this.generation) this.targets.set(balancer, target);
       },
       (routes) => {
@@ -204,7 +187,7 @@ export class ServiceRouteSession {
         this.status = { revision: previous.revision, fingerprint: previous.fingerprint, state: visible.some((route) => route.state === "blocked") ? "unavailable" : "applied", routes: visible };
         this.report(this.status);
       },
-      async (tag) => { const port = ports.get(tag); return port !== undefined && await this.serviceProbes.dns(port, auth, compiled.resolvers ?? [], undefined, () => probeServiceRouteDns(port, auth, compiled.resolvers ?? [])); });
+      async (tag) => { const port = ports.get(tag); return port !== undefined && await probeServiceRouteDns(port, auth, compiled.resolvers ?? []); });
     this.runtime.setSuspended(this.suspended || this.policySuspended);
     if (compiled.automatic) {
       const candidates = compiled.automatic.candidates;
@@ -235,7 +218,7 @@ export class ServiceRouteSession {
             open: async (_executable, candidate, childSignal) => {
               if (generation !== this.generation) throw new Error("Подключение изменилось");
               const route = byId.get(candidate.id); if (!route) throw new Error("Маршрут недоступен");
-              return await openExistingRouteProbe(route.port, auth, childSignal, { verifyData: !verified(this.bodyProofKey(route)), core: this.routeProbes });
+              return await openExistingRouteProbe(route.port, auth, childSignal, { verifyData: !verified(this.bodyProofKey(route)) });
             }, now: this.clock,
           });
           if (generation !== this.generation || signal.aborted) return {};
@@ -279,16 +262,12 @@ export class ServiceRouteSession {
     this.report(this.status);
   }
   stop(): void {
-    this.xrayApi.cancel();
-    this.serviceProbes.cancel();
-    this.routeProbes.cancel();
     this.generation += 1;
     if (this.timer) clearInterval(this.timer);
     this.timer = null; this.automatic?.stop(); this.automatic = null; this.automaticFactory = null; this.mainContext = null;
     this.automaticRequested = false; this.automaticEpoch++; this.mainWrites = Promise.resolve(); this.mainPending = 0; this.activity.reset(); this.verifiedBodies.clear(); this.knownRouteIds.clear(); this.bodyNetwork = undefined; this.installedMainId = null; this.usingServicePolicy = false; this.runtime?.stop(); this.runtime = null; this.targets.clear(); this.status = null; this.auth = undefined; this.mainExit = null; this.policySuspended = false;
   }
   setSuspended(suspended: boolean): void {
-    if (suspended) { this.serviceProbes.cancel(); this.routeProbes.cancel(); }
     this.suspended = suspended; this.automatic?.setSuspended(suspended); this.activity.reset(); this.verifiedBodies.clear(); this.runtime?.setSuspended(suspended || this.policySuspended);
     if (!suspended) void this.refresh();
   }

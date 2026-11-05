@@ -143,10 +143,9 @@ function probe(port: number, address: string, servername: string, auth: ServiceR
 
 
 /** Checks an actual DNS wire answer through the candidate, independently of transport-only main health. */
-export async function probeServiceRouteDns(port: number, auth: ServiceRouteAuth, resolvers: readonly string[], signal?: AbortSignal): Promise<boolean> {
+export async function probeServiceRouteDns(port: number, auth: ServiceRouteAuth, resolvers: readonly string[]): Promise<boolean> {
   for (const resolver of resolvers) {
-    if (signal?.aborted) return false;
-    if (await queryResolver(port, auth, resolver, signal)) return true;
+    if (await queryResolver(port, auth, resolver)) return true;
   }
   return false;
 }
@@ -157,39 +156,29 @@ function dnsQuestion(): Buffer {
 function dnsAnswer(value: Buffer, expectedId: number): boolean {
   if (value.length < 12 || value.readUInt16BE(0) !== expectedId || (value[2]! & 0x80) === 0
     || (value[2]! & 2) !== 0 || (value[3]! & 15) !== 0 || value.readUInt16BE(4) !== 1) return false;
-  const readName = (start: number): { end: number; labels: string[] } | undefined => {
-    let offset = start; let end: number | undefined; let bytes = 0;
-    const seen = new Set<number>(); const labels: string[] = [];
-    for (let hops = 0; hops < 128 && offset < value.length; hops++) {
-      if (seen.has(offset)) return undefined;
-      seen.add(offset);
+  const skipName = (start: number): number => {
+    let offset = start;
+    for (let labels = 0; labels < 128 && offset < value.length; labels++) {
       const length = value[offset++]!;
-      if (length === 0) return { end: end ?? offset, labels };
+      if (length === 0) return offset;
       if ((length & 0xc0) === 0xc0) {
-        if (offset >= value.length) return undefined;
-        end ??= offset + 1;
-        offset = (length & 63) << 8 | value[offset]!;
-        continue;
+        if (offset >= value.length || ((length & 63) << 8 | value[offset]!) >= value.length) return -1;
+        return offset + 1;
       }
-      bytes += length + 1;
-      if (length > 63 || bytes > 255 || offset + length > value.length) return undefined;
-      labels.push(value.subarray(offset, offset + length).toString("latin1").toLowerCase()); offset += length;
+      if (length > 63 || offset + length > value.length) return -1;
+      offset += length;
     }
-    return undefined;
+    return -1;
   };
-  const question = readName(12);
-  if (!question || question.labels.length !== 2 || question.labels[0] !== "example" || question.labels[1] !== "com") return false;
-  let offset = question.end;
-  if (offset + 4 > value.length || value.readUInt16BE(offset) !== 1 || value.readUInt16BE(offset + 2) !== 1) return false;
+  let offset = skipName(12);
+  if (offset < 0 || offset + 4 > value.length || value.readUInt16BE(offset) !== 1 || value.readUInt16BE(offset + 2) !== 1) return false;
   offset += 4;
   const count = value.readUInt16BE(6);
   if (count < 1 || count > 1024) return false;
   let foundAddress = false;
   for (let index = 0; index < count; index++) {
-    const record = readName(offset);
-    if (!record) return false;
-    offset = record.end;
-    if (offset + 10 > value.length) return false;
+    offset = skipName(offset);
+    if (offset < 0 || offset + 10 > value.length) return false;
     const type = value.readUInt16BE(offset); const recordClass = value.readUInt16BE(offset + 2);
     const length = value.readUInt16BE(offset + 8); offset += 10;
     if (offset + length > value.length) return false;
@@ -199,8 +188,7 @@ function dnsAnswer(value: Buffer, expectedId: number): boolean {
   return foundAddress;
 }
 
-async function queryResolver(port: number, auth: ServiceRouteAuth, resolver: string, signal?: AbortSignal): Promise<boolean> {
-  if (signal?.aborted) return false;
+async function queryResolver(port: number, auth: ServiceRouteAuth, resolver: string): Promise<boolean> {
   let url: URL;
   try { url = new URL(resolver); } catch { return false; }
   if (!["https:", "tcp:"].includes(url.protocol) || url.username || url.password || url.hash) return false;
@@ -213,12 +201,9 @@ async function queryResolver(port: number, auth: ServiceRouteAuth, resolver: str
     const proxy = request({ hostname: "127.0.0.1", port, method: "CONNECT", path: destination, agent: false,
       headers: { "Proxy-Authorization": proxyAuthorization(auth) } });
     const finish = (ok: boolean): void => {
-      if (settled) return; settled = true; clearTimeout(timer); signal?.removeEventListener("abort", onAbort);
-      dnsRequest?.destroy(); tls?.destroy(); socket?.destroy(); proxy.destroy(); resolve(ok);
+      if (settled) return; settled = true; clearTimeout(timer); dnsRequest?.destroy(); tls?.destroy(); socket?.destroy(); proxy.destroy(); resolve(ok);
     };
-    const onAbort = (): void => finish(false);
     const timer = setTimeout(() => finish(false), 3500);
-    signal?.addEventListener("abort", onAbort, { once: true });
     proxy.once("error", () => finish(false)); proxy.once("response", () => finish(false));
     proxy.once("connect", (response, connected, head) => {
       socket = connected;

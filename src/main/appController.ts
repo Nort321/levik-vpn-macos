@@ -1,3 +1,4 @@
+import type { CreateApiDiscovery } from "./core/nativeApiDiscovery";
 import { corePublicFetch, type NativePublicClient } from "./core/publicFetch";
 import { TelemetryClient } from "./telemetry/telemetryClient";
 import { CoreApprovals } from "./core/coreApprovals";
@@ -268,6 +269,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
   private readonly updater: AppUpdater | null;
   private identity!: DeviceIdentity;
   private api!: MobileApiClient;
+  private createApiDiscovery: CreateApiDiscovery | undefined;
   private accessToken: string | null = null;
   private profile: PreparedTunnelProfile | null = null;
   private lastServiceRouteReport: string | null = null;
@@ -458,6 +460,8 @@ export class AppController extends EventEmitter<AppControllerEvents> {
       () => this.endpointsStore.refresh(ENDPOINTS_RETRY_MS),
       this.publicFetch,
     );
+    this.api.useRustCore(this.core, this.createApiDiscovery,
+      () => this.recordDiagnostic("Rust-ядро: выбор API использует резервную реализацию"));
     this.bindCoreEvents();
     this.liveEvents = new LiveEvents(
       (signal) => this.api.openEvents(this.requireToken(), signal),
@@ -2437,6 +2441,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
 
   /** Stage 2 of the Rust migration: the loaded module, compared with TypeScript or in charge per remote config. */
   useRustCore(status: LevikCoreStatus): void {
+    this.createApiDiscovery = status.state === "loaded" ? status.module.createApiDiscovery : undefined;
     const version = status.state === "loaded" ? status.info.version : null;
     this.core = new RustCore(coreBridge(status), (line) => this.recordDiagnostic(line), "ts", version);
     this.telemetry.useCore(() => this.core.tally());
@@ -2444,6 +2449,8 @@ export class AppController extends EventEmitter<AppControllerEvents> {
       () => this.recordDiagnostic("Rust-ядро: очередь анонимных отчётов использует резервную реализацию"));
     const openConfigCache = status.state === "loaded" ? status.module.openConfigCache : undefined;
     const reportCache = () => this.recordDiagnostic("Rust-ядро: кэш конфигурации использует резервную реализацию");
+    this.api?.useRustCore(this.core, this.createApiDiscovery,
+      () => this.recordDiagnostic("Rust-ядро: выбор API использует резервную реализацию"));
     this.liveEvents?.useRustCore(this.core);
     this.remoteConfigStore.useRustCore(this.core, openConfigCache, reportCache);
     this.endpointsStore.useRustCore(this.core, openConfigCache, reportCache);

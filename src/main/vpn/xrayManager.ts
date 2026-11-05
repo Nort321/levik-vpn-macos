@@ -1,3 +1,5 @@
+import { CoreXrayApi, type StartXrayRequest } from "../core/nativeXrayApi";
+import type { RustCore } from "../core/rustCore";
 import { ServiceRouteSession } from "./serviceRouteSession";
 import type { ServiceRouteStatus } from "./serviceRoutes";
 import { app } from "electron";
@@ -21,6 +23,11 @@ interface XrayEvents {
 
 export class XrayManager extends EventEmitter<XrayEvents> {
   readonly serviceRoutes = new ServiceRouteSession((status) => this.emit("serviceRoutes", status));
+  private readonly localApi = new CoreXrayApi();
+  useRustCore(current: () => RustCore, start: StartXrayRequest | undefined, report: () => void): void {
+    this.localApi.useRustCore(current, start, report);
+    this.serviceRoutes.useRustCore(current, start, report);
+  }
   private running = false;
   private stopping = false;
   private statsTimer: ReturnType<typeof setInterval> | null = null;
@@ -77,7 +84,9 @@ export class XrayManager extends EventEmitter<XrayEvents> {
     try {
       if (this.serviceRoutes.authentication) {
         if (this.serviceRoutes.active) await this.serviceRoutes.queryStats();
-      } else await this.statsClient.query("inbound>>>levik-tun-in>>>");
+      } else await this.localApi.statistics(undefined, async () => ({
+        ...await this.statsClient.query("inbound>>>levik-tun-in>>>"), initialized: false,
+      }));
       const healthy = this.serviceRoutes.active || (this.serviceRoutes.authentication
         ? await this.serviceRoutes.probeCurrent() : await this.probeHealth({ onFailure }));
       return healthy && this.running && generation === this.statsGeneration;
@@ -104,6 +113,7 @@ export class XrayManager extends EventEmitter<XrayEvents> {
   }
 
   private stopStatsPolling(): void {
+    this.localApi.cancel();
     if (this.statsTimer) clearInterval(this.statsTimer);
     this.statsTimer = null;
     if (this.healthTimer) clearInterval(this.healthTimer);
@@ -159,7 +169,9 @@ export class XrayManager extends EventEmitter<XrayEvents> {
     const generation = this.statsGeneration;
     try {
       const values = this.serviceRoutes.authentication ? await this.serviceRoutes.queryStats()
-        : await this.statsClient.query("inbound>>>levik-tun-in>>>traffic>>>");
+        : await this.localApi.statistics(undefined, async () => ({
+          ...await this.statsClient.query("inbound>>>levik-tun-in>>>traffic>>>"), initialized: false,
+        }));
       if (generation !== this.statsGeneration) return;
       this.statsErrorReported = false;
       if (this.running) this.emit("stats", values.downlink, values.uplink);

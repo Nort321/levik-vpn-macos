@@ -1,3 +1,4 @@
+import { CoreServiceProbes, type StartServiceProbe } from "../core/nativeServiceProbes";
 import { CoreXrayApi, type StartXrayRequest } from "../core/nativeXrayApi";
 import type { RustCore } from "../core/rustCore";
 import { compiledServiceRoutes, SERVICE_MAIN_BALANCER, ServiceRouteRuntime, type ServiceRouteStatus, type ServiceRoutePolicy, type ServiceRouteAuth } from "./serviceRoutes";
@@ -17,8 +18,10 @@ export interface SmartAutoSessionHooks {
 /** Owns only routing API overrides; never starts/stops a core or modifies protected-mode settings. */
 export class ServiceRouteSession {
   private readonly xrayApi = new CoreXrayApi();
-  useRustCore(current: () => RustCore, start: StartXrayRequest | undefined, report: () => void): void {
+  private readonly serviceProbes = new CoreServiceProbes();
+  useRustCore(current: () => RustCore, start: StartXrayRequest | undefined, report: () => void, startProbe?: StartServiceProbe): void {
     this.xrayApi.useRustCore(current, start, report);
+    this.serviceProbes.useRustCore(current, startProbe, report);
   }
   private overrideRoute(balancer: string, target: string, auth: ServiceRouteAuth): Promise<void> {
     return this.xrayApi.override(balancer, target, auth, () => overrideServiceRoute(balancer, target, undefined, auth));
@@ -63,7 +66,8 @@ export class ServiceRouteSession {
   async probeCurrent(): Promise<boolean> {
     const tag = this.targets.get(SERVICE_MAIN_BALANCER);
     const candidate = this.mainContext?.candidates.find((item) => item.tag === tag);
-    return Boolean(candidate && this.auth && await probeServiceRoute(candidate.port, this.auth));
+    const auth = this.auth;
+    return Boolean(candidate && auth && await this.serviceProbes.transport(candidate.port, auth, () => probeServiceRoute(candidate.port, auth)));
   }
   configureSmartAuto(hooks: SmartAutoSessionHooks): void { this.smartHooks = hooks; }
   /** Hot mode changes preserve the core/TUN and freeze the last acknowledged
@@ -177,7 +181,7 @@ export class ServiceRouteSession {
     this.usingServicePolicy = compiled.policyActive ?? true;
     const ports = new Map(compiled.probes.map((probe) => [probe.tag, probe.port]));
     this.runtime = new ServiceRouteRuntime(compiled.plans,
-      async (tag) => { const port = ports.get(tag); return port !== undefined && await probeServiceRoute(port, auth); },
+      async (tag) => { const port = ports.get(tag); return port !== undefined && await this.serviceProbes.transport(port, auth, () => probeServiceRoute(port, auth)); },
       async (balancer, target) => {
         if (generation !== this.generation) return;
         // __main belongs only to SmartAuto when present; service rules retain
@@ -197,7 +201,7 @@ export class ServiceRouteSession {
         this.status = { revision: previous.revision, fingerprint: previous.fingerprint, state: visible.some((route) => route.state === "blocked") ? "unavailable" : "applied", routes: visible };
         this.report(this.status);
       },
-      async (tag) => { const port = ports.get(tag); return port !== undefined && await probeServiceRouteDns(port, auth, compiled.resolvers ?? []); });
+      async (tag) => { const port = ports.get(tag); return port !== undefined && await this.serviceProbes.dns(port, auth, compiled.resolvers ?? [], undefined, () => probeServiceRouteDns(port, auth, compiled.resolvers ?? [])); });
     this.runtime.setSuspended(this.suspended || this.policySuspended);
     if (compiled.automatic) {
       const candidates = compiled.automatic.candidates;
@@ -273,12 +277,14 @@ export class ServiceRouteSession {
   }
   stop(): void {
     this.xrayApi.cancel();
+    this.serviceProbes.cancel();
     this.generation += 1;
     if (this.timer) clearInterval(this.timer);
     this.timer = null; this.automatic?.stop(); this.automatic = null; this.automaticFactory = null; this.mainContext = null;
     this.automaticRequested = false; this.automaticEpoch++; this.mainWrites = Promise.resolve(); this.mainPending = 0; this.activity.reset(); this.verifiedBodies.clear(); this.knownRouteIds.clear(); this.bodyNetwork = undefined; this.installedMainId = null; this.usingServicePolicy = false; this.runtime?.stop(); this.runtime = null; this.targets.clear(); this.status = null; this.auth = undefined; this.mainExit = null; this.policySuspended = false;
   }
   setSuspended(suspended: boolean): void {
+    if (suspended) this.serviceProbes.cancel();
     this.suspended = suspended; this.automatic?.setSuspended(suspended); this.activity.reset(); this.verifiedBodies.clear(); this.runtime?.setSuspended(suspended || this.policySuspended);
     if (!suspended) void this.refresh();
   }

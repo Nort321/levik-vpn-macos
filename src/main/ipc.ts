@@ -9,6 +9,7 @@ import { AppController } from "./appController";
 import { isAbsolute } from "node:path";
 import { listMacApplications, macApplicationFromPath } from "./macos/processes";
 import { isAllowedExternalUrl, isCabinetTarget } from "./platform/links";
+import { isPairingId } from "./platform/devicePairing";
 
 export function registerIpc(controller: AppController, window: BrowserWindow): void {
   ipcMain.handle(IPC.snapshot, () => controller.snapshot());
@@ -100,6 +101,19 @@ export function registerIpc(controller: AppController, window: BrowserWindow): v
   ipcMain.handle(IPC.authorizeActivation, (_event, code: unknown) => {
     if (typeof code !== "string") throw new Error("Некорректный код активации");
     return controller.authorizeActivation(code);
+  });
+  ipcMain.handle(IPC.signInWithPairingCode, (_event, code: unknown) => {
+    if (typeof code !== "string" || code.length > 64) throw new Error("Некорректный код входа");
+    return controller.signInWithPairingCode(code);
+  });
+  ipcMain.handle(IPC.createDevicePairing, () => controller.createDevicePairing());
+  ipcMain.handle(IPC.devicePairingStatus, (_event, id: unknown) => {
+    if (!isPairingId(id)) throw new Error("Некорректный QR-код");
+    return controller.devicePairingStatus(id);
+  });
+  ipcMain.handle(IPC.cancelDevicePairing, (_event, id: unknown) => {
+    if (!isPairingId(id)) throw new Error("Некорректный QR-код");
+    return controller.cancelDevicePairing(id);
   });
   ipcMain.handle(IPC.checkForUpdates, () => controller.checkForUpdates());
   ipcMain.handle(IPC.downloadUpdate, () => controller.downloadUpdate());

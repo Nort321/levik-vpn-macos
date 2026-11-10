@@ -11,6 +11,8 @@ Levik VPN for macOS includes:
 - sing-box v1.14.2 — GPL-3.0-or-later; runs as a separate TUIC v5 process.
   https://github.com/SagerNet/sing-box/tree/v1.14.2
   The upstream LICENSE is included next to the verified release binary.
+- [sing-box-lx v1.14.4-lx.31](https://github.com/Leadaxe/sing-box-lx/tree/v1.14.4-lx.31) — GPL-3.0-or-later; runs as a separate TrustTunnel process.
+  The upstream LICENSE is included next to the verified release binary.
 - electron-updater — MIT. https://github.com/electron-userland/electron-builder
 
 Original Levik client code and the macOS helper are AGPL-3.0-only; see LICENSE.

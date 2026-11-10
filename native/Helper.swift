@@ -16,6 +16,7 @@ let bundleURL = resourcesURL.deletingLastPathComponent().deletingLastPathCompone
 let coreURL = resourcesURL.appendingPathComponent("xray/xray")
 // TUIC v5 sidecar: Xray has no TUIC client, so a bundled sing-box carries it.
 let tuicCoreURL = resourcesURL.appendingPathComponent("singbox/sing-box")
+let trustTunnelCoreURL = resourcesURL.appendingPathComponent("trusttunnel/sing-box")
 
 struct HelperError: Error, CustomStringConvertible {
     let description: String
@@ -515,6 +516,42 @@ func tuicCoreConfig(_ tuic: TuicParameters, localPort: Int, localID: String, int
     ]
 }
 
+struct TrustTunnelParameters {
+    let address: String
+    let port: Int
+    let username: String
+    let password: String
+    let serverName: String
+    let quic: Bool
+}
+
+func parseTrustTunnelParameters(_ value: Any) throws -> TrustTunnelParameters {
+    var ip = in_addr()
+    guard let object = value as? [String: Any],
+          Set(object.keys) == ["address", "port", "username", "password", "serverName", "quic"],
+          let address = object["address"] as? String, inet_pton(AF_INET, address, &ip) == 1,
+          let port = object["port"] as? Int, (1...65535).contains(port),
+          let username = object["username"] as? String, matches(username, "^[a-f0-9]{32}$"),
+          let password = object["password"] as? String, matches(password, "^[A-Za-z0-9_-]{43}$"),
+          let serverName = object["serverName"] as? String, serverName.utf8.count <= 253,
+          matches(serverName, "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"),
+          let quic = object["quic"] as? Bool else { throw HelperError("Некорректный профиль TrustTunnel") }
+    return TrustTunnelParameters(address: address, port: port, username: username, password: password, serverName: serverName, quic: quic)
+}
+
+func trustTunnelCoreConfig(_ endpoint: TrustTunnelParameters, localPort: Int, localID: String, interface: String) -> [String: Any] {
+    var tls: [String: Any] = ["enabled": true, "server_name": endpoint.serverName]
+    if !endpoint.quic { tls["utls"] = ["enabled": true, "fingerprint": "chrome"] }
+    return [
+        "log": ["disabled": true],
+        "inbounds": [["type": "vless", "listen": "127.0.0.1", "listen_port": localPort, "users": [["uuid": localID]]]],
+        "outbounds": [["type": "trusttunnel", "tag": "trusttunnel", "server": endpoint.address, "server_port": endpoint.port,
+                       "username": endpoint.username, "password": endpoint.password, "quic": endpoint.quic,
+                       "bind_interface": interface, "tls": tls]],
+        "route": ["final": "trusttunnel"],
+    ]
+}
+
 func freeLoopbackPort() throws -> Int {
     let descriptor = socket(AF_INET, SOCK_STREAM, 0)
     try require(descriptor >= 0, "Не удалось выделить локальный порт")
@@ -610,8 +647,10 @@ final class TunnelSession {
         return ["running": running, "killSwitch": killSwitch && enabled && rules.contains("levik-kill-switch"), "dnsProtection": dnsProtection && enabled && rules.contains("levik-dns"), "pid": child.map { Int($0.processIdentifier) } as Any? ?? NSNull(), "exitCode": exitCode.map { Int($0) } as Any? ?? NSNull()]
     }
 
-    func start(_ supplied: [String: Any], killSwitch: Bool, dns: Bool, tuic: TuicParameters?, guestHost: String? = nil) throws {
+    func start(_ supplied: [String: Any], killSwitch: Bool, dns: Bool, tuic: TuicParameters?, guestHost: String? = nil,
+               trustTunnel: TrustTunnelParameters? = nil) throws {
         try validateConfig(supplied)
+        try require(trustTunnel == nil || (tuic == nil && guestHost == nil), "Некорректный профиль TrustTunnel")
         try require(try signedBundleHash() == signature, "Приложение обновилось. Перезапустите Levik VPN.")
         try stop()
         outboundInterface = try guestHost.map { try guestOutboundInterface($0, config: supplied) } ?? primaryOutboundInterface()
@@ -619,13 +658,13 @@ final class TunnelSession {
         // Any failure before the session is reported running must not leave the sidecar behind.
         var sidecarCommitted = false
         defer { if !sidecarCommitted { stopTuic() } }
-        if let tuic {
+        if tuic != nil || trustTunnel != nil {
             guard var outbounds = config["outbounds"] as? [[String: Any]], var first = outbounds.first,
                   first["protocol"] as? String == "vless", Set(first.keys) == ["tag", "protocol", "settings"],
                   let settings = first["settings"] as? [String: Any], settings.count == 1,
                   let vnext = settings["vnext"] as? [[String: Any]], vnext.count == 1,
-                  vnext[0]["address"] as? String == "127.0.0.1", vnext[0]["port"] as? Int == 1 else { throw HelperError("Некорректный VPN-профиль TUIC") }
-            let local = try startTuic(tuic)
+                  vnext[0]["address"] as? String == "127.0.0.1", vnext[0]["port"] as? Int == 1 else { throw HelperError("Некорректный локальный профиль VPN") }
+            let local = try startLocalSidecar(tuic: tuic, trustTunnel: trustTunnel)
             first["settings"] = ["vnext": [["address": "127.0.0.1", "port": local.port, "users": [["id": local.id, "encryption": "none"]]]]]
             outbounds[0] = first
             config["outbounds"] = outbounds
@@ -713,20 +752,30 @@ final class TunnelSession {
         throw HelperError("VPN-туннель не запустился. Защита сохраняется до отключения VPN.")
     }
 
-    func startTuic(_ tuic: TuicParameters) throws -> (port: Int, id: String) {
-        try require(FileManager.default.isExecutableFile(atPath: tuicCoreURL.path), "Компонент TUIC не найден. Переустановите Levik VPN.")
+    func startLocalSidecar(tuic: TuicParameters?, trustTunnel: TrustTunnelParameters?) throws -> (port: Int, id: String) {
+        let binary = trustTunnel == nil ? tuicCoreURL : trustTunnelCoreURL
+        let name = trustTunnel == nil ? "TUIC" : "TrustTunnel"
+        try require(FileManager.default.isExecutableFile(atPath: binary.path), "Компонент \(name) не найден. Переустановите Levik VPN.")
         let port = try freeLoopbackPort()
         let id = try randomSessionID()
         let configPath = runtimeDirectory + "/tuic-core-config.json"
         let workDirectory = runtimeDirectory + "/tuic"
         if mkdir(workDirectory, 0o700) != 0 { try require(errno == EEXIST, "Не удалось подготовить каталог TUIC") }
-        let bytes = try JSONSerialization.data(withJSONObject: tuicCoreConfig(tuic, localPort: port, localID: id, interface: outboundInterface))
+        let config: [String: Any]
+        if let trustTunnel {
+            config = trustTunnelCoreConfig(trustTunnel, localPort: port, localID: id, interface: outboundInterface)
+        } else if let tuic {
+            config = tuicCoreConfig(tuic, localPort: port, localID: id, interface: outboundInterface)
+        } else {
+            throw HelperError("Компонент VPN не выбран")
+        }
+        let bytes = try JSONSerialization.data(withJSONObject: config)
         try require(FileManager.default.createFile(atPath: configPath, contents: bytes, attributes: [.posixPermissions: 0o600]), "Не удалось записать конфигурацию TUIC")
         chmod(configPath, 0o600)
-        let check = try run(tuicCoreURL.path, ["check", "-c", configPath, "-D", workDirectory])
-        try require(check.0 == 0, "Ядро TUIC отклонило профиль")
+        let check = try run(binary.path, ["check", "-c", configPath, "-D", workDirectory])
+        try require(check.0 == 0, "Ядро \(name) отклонило профиль")
         let process = Process()
-        process.executableURL = tuicCoreURL
+        process.executableURL = binary
         process.arguments = ["run", "-c", configPath, "-D", workDirectory, "--disable-color"]
         process.environment = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "en_US.UTF-8"]
         let output = Pipe()
@@ -751,11 +800,14 @@ final class TunnelSession {
         }
         let deadline = Date().addingTimeInterval(8)
         while Date() < deadline && process.isRunning {
-            if loopbackPortAccepts(port) { return (port, id) }
+            if loopbackPortAccepts(port) {
+                if trustTunnel != nil { try? FileManager.default.removeItem(atPath: configPath) }
+                return (port, id)
+            }
             Thread.sleep(forTimeInterval: 0.05)
         }
         stopTuic()
-        throw HelperError("Ядро TUIC не запустилось")
+        throw HelperError("Ядро \(name) не запустилось")
     }
 
     func stopTuic() {
@@ -874,6 +926,7 @@ final class TunnelSession {
 
     func recoverOrphanedCore() throws {
         recoverOrphanedProcess(record: "/tuic-core.json", executable: tuicCoreURL)
+        recoverOrphanedProcess(record: "/tuic-core.json", executable: trustTunnelCoreURL)
         try? FileManager.default.removeItem(atPath: runtimeDirectory + "/tuic-core-config.json")
         recoverOrphanedProcess(record: "/core.json", executable: coreURL)
     }
@@ -998,8 +1051,10 @@ func serve(parent: pid_t) throws {
                         guard let config = object["config"] as? [String: Any], let killSwitch = object["killSwitch"] as? Bool, let dns = object["dnsProtection"] as? Bool else { throw HelperError("Некорректный VPN-профиль") }
                         if let dnsServer = object["dnsServer"] as? String { try require(isIP(dnsServer), "Некорректный DNS"); session.dnsServer = dnsServer }
                         let tuic = try object["tuic"].map(parseTuicParameters)
+                        let trustTunnel = try object["trustTunnel"].map(parseTrustTunnelParameters)
                         if object["guestHost"] != nil && !(object["guestHost"] is String) { throw HelperError("Некорректный адрес телефона") }
-                        try session.start(config, killSwitch: killSwitch, dns: dns, tuic: tuic, guestHost: object["guestHost"] as? String)
+                        try session.start(config, killSwitch: killSwitch, dns: dns, tuic: tuic,
+                                          guestHost: object["guestHost"] as? String, trustTunnel: trustTunnel)
                     case "stop": try session.stop()
                     case "protection":
                         guard let killSwitch = object["killSwitch"] as? Bool, let dns = object["dnsProtection"] as? Bool else { throw HelperError("Некорректные параметры защиты") }

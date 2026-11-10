@@ -273,6 +273,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
   private reconnectAttempts = 0;
   private lastConfig: Record<string, unknown> | null = null;
   private lastTuic: TuicEndpoint | undefined;
+  private lastTrustTunnel: TunnelServer["trustTunnel"];
   private lockdownActive = false;
   private trafficDownloadOffset = 0;
   private trafficUploadOffset = 0;
@@ -526,7 +527,9 @@ export class AppController extends EventEmitter<AppControllerEvents> {
   }
 
   snapshot(): AppSnapshot {
-    return structuredClone(this.state);
+    const snapshot = structuredClone(this.state);
+    for (const server of snapshot.servers) delete server.trustTunnel;
+    return snapshot;
   }
 
   async beginLogin(): Promise<LoginChallenge> {
@@ -746,6 +749,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     this.cancelRouteProbes();
     this.connectionIntent += 1;
     this.lastConfig = null;
+    this.lastTrustTunnel = undefined;
     this.lastTuic = undefined;
     this.lastWorkingServerId = null;
     this.trafficCheck = null;
@@ -757,6 +761,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     if (!this.guestConnection.active) return;
     await this.guestConnection.disconnect();
     this.lastConfig = null;
+    this.lastTrustTunnel = undefined;
     this.lastTuic = undefined;
     this.lastWorkingServerId = null;
     this.resetTrafficStats();
@@ -815,6 +820,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
         const config = buildXrayConfig(this.serviceProfileFor(server), server, this.state.settings);
         this.lastConfig = config;
         this.lastTuic = server.tuic;
+        this.lastTrustTunnel = server.trustTunnel;
         // The helper verifies traffic through the tunnel before it reports success.
         progress.reach("core", "core_start_failed");
         await this.startXray(config);
@@ -910,6 +916,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     }
     this.lockdownActive = false;
     this.lastConfig = null;
+    this.lastTrustTunnel = undefined;
     this.lastTuic = undefined;
     this.patch({ status: "disconnected", statusDetail: null, sessionStartedAt: null });
   }
@@ -2252,6 +2259,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     this.lastServiceRouteReport = null;
     this.patch({ serviceRoutes: null, serviceRouteNotice: null, serviceRouteDetails: [] });
     this.lastConfig = null;
+    this.lastTrustTunnel = undefined;
     this.lastTuic = undefined;
     this.settingsRevision = 0;
     this.pendingSync = {};
@@ -2365,7 +2373,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
   }
 
   private async startXray(config: Record<string, unknown>): Promise<void> {
-    await this.xray.start(config, this.lastTuic);
+    await this.xray.start(config, this.lastTuic, undefined, this.lastTrustTunnel);
     try {
       await this.killSwitch.allowTunnel();
     } catch (error) {
@@ -2669,6 +2677,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
 
   /** Servers the automatic choice may take. */
   private automaticCandidates(servers: TunnelServer[]): TunnelServer[] {
+    servers = servers.filter((server) => !server.trustTunnel);
     // A home exit («🏠») is only ever the user's own choice.
     const ordinary = servers.filter((item) => !isHomeRoadServer(item.name));
     const offered = ordinary.length ? ordinary : servers;

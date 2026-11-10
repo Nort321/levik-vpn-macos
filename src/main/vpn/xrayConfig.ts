@@ -33,8 +33,9 @@ export function buildXrayConfig(
   server: TunnelServer,
   settings: AppSettings,
 ): Record<string, unknown> {
-  const antiDpiOutbound = server.tuic ? server.outbound : withAntiDpi(server, settings);
-  const selectedOutbound = server.tuic ? tuicLocalOutbound(server.tag) : withAlternateXhttpMux(antiDpiOutbound);
+  const sidecar = server.tuic || server.trustTunnel;
+  const antiDpiOutbound = sidecar ? server.outbound : withAntiDpi(server, settings);
+  const selectedOutbound = sidecar ? tuicLocalOutbound(server.tag) : withAlternateXhttpMux(antiDpiOutbound);
   const directDomains = [...profile.directDomains];
   const proxyDomains = [...profile.proxyDomains];
   if (settings.routingMode === "blockedOnly") proxyDomains.push(...BLOCKED_DOMAINS);

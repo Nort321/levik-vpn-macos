@@ -12,6 +12,7 @@
     "test": "vitest run",
     "download:xray": "node scripts/download-xray.mjs",
     "download:singbox": "node scripts/download-singbox.mjs",
+    "download:trusttunnel": "node scripts/download-trusttunnel.mjs",
     "package:mac": "npm run build && electron-builder --mac dmg zip --publish never",
     "check": "npm run lint && npm run build && npm test",
     "package:local": "npm run build && electron-builder --mac dmg zip --publish never --config.mac.identity=- --config.mac.entitlements=build/entitlements.local.plist --config.mac.entitlementsInherit=build/entitlements.local.plist"
@@ -45,6 +46,11 @@
       "package.json"
     ],
     "extraResources": [
+      {
+        "from": "vendor/trusttunnel/darwin-${arch}",
+        "to": "trusttunnel",
+        "filter": ["sing-box", "LICENSE"]
+      },
       {
         "from": "vendor/xray/darwin-${arch}",
         "to": "xray",
@@ -97,7 +103,8 @@
       "binaries": [
         "Contents/Resources/native/levik-helper",
         "Contents/Resources/xray/xray",
-        "Contents/Resources/singbox/sing-box"
+        "Contents/Resources/singbox/sing-box",
+        "Contents/Resources/trusttunnel/sing-box"
       ]
     },
     "dmg": {

@@ -93,12 +93,22 @@ export interface TuicEndpoint {
   caCertificatePem: string;
 }
 
+export interface TrustTunnelEndpoint {
+  address: string;
+  port: number;
+  username: string;
+  password: string;
+  serverName: string;
+  quic: boolean;
+}
+
 export interface TunnelServer {
   id: string;
   tag: string;
   name: string;
   countryCode: string;
   outbound: Record<string, unknown>;
+  trustTunnel?: TrustTunnelEndpoint;
   tuic?: TuicEndpoint;
 }
 

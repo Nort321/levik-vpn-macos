@@ -59,6 +59,7 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
       - run: npm run download:xray
       - run: npm run download:singbox
+      - run: npm run download:trusttunnel
       - run: npm run lint
       - run: npm run build
       # Bound process contention for desktop and OS fixtures on hosted runners.

@@ -1,3 +1,4 @@
+import { EXTERNAL_AUTO_ID } from "../../shared/externalPool";
 import { withServiceRoutes } from "./serviceRoutes";
 import type { AppSettings, TunnelServer } from "../../shared/contracts";
 import type { PreparedTunnelProfile } from "./tunnelProfile";
@@ -33,6 +34,8 @@ export function buildXrayConfig(
   server: TunnelServer,
   settings: AppSettings,
 ): Record<string, unknown> {
+  if (server.id === EXTERNAL_AUTO_ID) throw new Error("Сначала проверьте безлимитные серверы");
+  profile = { ...profile, servers: profile.servers.filter((item) => item.id !== EXTERNAL_AUTO_ID) };
   const sidecar = server.tuic || server.trustTunnel;
   const antiDpiOutbound = sidecar ? server.outbound : withAntiDpi(server, settings);
   const selectedOutbound = sidecar ? tuicLocalOutbound(server.tag) : withAlternateXhttpMux(antiDpiOutbound);

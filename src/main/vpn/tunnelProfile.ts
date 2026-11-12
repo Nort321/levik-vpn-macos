@@ -1,3 +1,4 @@
+import { parseExternalPool, externalAutoServer, type ExternalPool } from "./externalPool";
 import { parseServiceRoutePolicy, type ServiceRoutePolicy } from "./serviceRoutes";
 import { isIPv4 } from "node:net";
 import { createDecipheriv, createHash, X509Certificate } from "node:crypto";
@@ -8,6 +9,7 @@ import { DeviceIdentity } from "../security/deviceIdentity";
 import { extractServerEndpoint } from "./serverPinger";
 
 export interface PreparedTunnelProfile {
+  externalPool?: ExternalPool;
   serviceRoutes?: ServiceRoutePolicy;
   profileId: string;
   subscriptionId: string;
@@ -19,6 +21,7 @@ export interface PreparedTunnelProfile {
 }
 
 interface RawTunnelProfile {
+  externalPool?: unknown;
   serviceRoutes?: unknown;
   version: number;
   profileId: string;
@@ -59,24 +62,26 @@ export function ruleRoutingKey(profile: Pick<PreparedTunnelProfile, "directDomai
 }
 
 export function prepareTunnelProfile(plaintext: Uint8Array, expectedSubscriptionId: string): PreparedTunnelProfile {
-  if (plaintext.byteLength < 2 || plaintext.byteLength > 4 * 1024 * 1024) throw new Error("Некорректный размер профиля");
+  if (plaintext.byteLength < 2 || plaintext.byteLength > 24 * 1024 * 1024) throw new Error("Некорректный размер профиля");
   const raw = JSON.parse(Buffer.from(plaintext).toString("utf8")) as RawTunnelProfile;
   if (raw.version !== 1 || raw.subscriptionId !== expectedSubscriptionId) throw new Error("Профиль не соответствует подписке");
   if (!/^[A-Za-z0-9._:-]{1,128}$/.test(raw.profileId)) throw new Error("Некорректный идентификатор профиля");
   if (!raw.source || typeof raw.source.content !== "string") throw new Error("Профиль не содержит конфигурацию");
+  const externalPool = parseExternalPool(raw.externalPool);
   const parsed = parseSource(raw.source.content);
   // Remnawave's stub links (expired, traffic used up, no ordinary servers…) are never servers.
   const servers = parsed.filter((server) => !isSubscriptionPlaceholder(server));
   const placeholder = parsed.find(isSubscriptionPlaceholder);
-  if (servers.length === 0 && placeholder) throw new Error(placeholderMessage(placeholder.name));
-  if (servers.length === 0 || servers.length > 200) throw new Error("В профиле нет совместимых серверов");
+  if (servers.length === 0 && placeholder && !externalPool?.servers.length) throw new Error(placeholderMessage(placeholder.name));
+  if (servers.length === 0 && !externalPool?.servers.length || servers.length > 200) throw new Error("В профиле нет совместимых серверов");
   const serviceRoutes = parseServiceRoutePolicy(raw.serviceRoutes);
   return {
     ...(serviceRoutes ? { serviceRoutes } : {}),
     profileId: raw.profileId,
     subscriptionId: raw.subscriptionId,
     subscriptionExpiresAt: raw.subscriptionExpiresAt ?? null,
-    servers,
+    servers: [...servers, ...(externalPool?.servers.length ? [externalAutoServer()] : [])],
+    ...(externalPool?.servers.length ? { externalPool } : {}),
     directCidrs: validateCidrs(raw.routing?.directCidrs ?? []),
     directDomains: validateDomains(raw.routing?.directDomains ?? []),
     proxyDomains: validateDomains(raw.routing?.proxyDomains ?? []),

@@ -40,7 +40,8 @@ import type { PreparedTunnelProfile } from "./vpn/tunnelProfile";
 import { buildXrayConfig } from "./vpn/xrayConfig";
 import { XrayManager } from "./vpn/xrayManager";
 import { measureServerLatencies, extractServerEndpoint } from "./vpn/serverPinger";
-import { measureRouteCandidates, measuredRouteUsable, type RouteMeasurement, type RouteProbeCandidate } from "./vpn/routeProbe";
+import { EXTERNAL_AUTO_ID, retainExternalPool, findExternalServer } from "./vpn/externalPool";
+import { openRouteProbe, measureRouteCandidates, measuredRouteUsable, type RouteMeasurement, type RouteProbeCandidate } from "./vpn/routeProbe";
 import type { LiveAutoUpdate } from "./vpn/smartAutoLiveRuntime";
 import { FAILED_TRAFFIC_CHECK_MS, isTunnelHealthy, measureTraffic } from "./vpn/tunnelHealth";
 import {
@@ -781,6 +782,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     }
     // A new automatic session: fresh load (1.5 s at most) and pings, then the best
     // server by them. A server switch inside a session keeps the server it was given.
+    if (!this.state.settings.automaticServer && this.state.selectedServerId === EXTERNAL_AUTO_ID && !await this.selectExternalRoute()) return;
     const newAutomaticSession = this.state.settings.automaticServer && !this.telemetry.active;
     const stalePings = !hasMeasuredLatency(this.state.serverLatencies)
       || (newAutomaticSession && Date.now() - this.latenciesMeasuredAt > LATENCY_FRESH_MS);
@@ -1250,6 +1252,9 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     const plaintext = decryptTunnelProfile(this.identity, response.profile);
     try {
       const profile = prepareTunnelProfile(plaintext, subscriptionId);
+      if (this.profile?.subscriptionId !== profile.subscriptionId) this.externalSelected = null;
+      retainExternalPool(profile, this.profile);
+      this.externalProfileFetchedAt = Date.now();
       if (this.profile?.subscriptionId === profile.subscriptionId && this.profile.serviceRoutes) profile.serviceRoutes = this.profile.serviceRoutes;
       this.profile = profile;
       const selected = this.state.selectedServerId;
@@ -1273,6 +1278,9 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     if (!stored || now - stored.fetchedAt >= stored.config.refreshAfterSeconds * 1_000) await this.refreshRemoteConfig();
     else await this.updateAnnouncements();
     if (!this.accessToken) return;
+    if (!this.state.busy && this.state.selectedSubscriptionId && now - this.externalProfileFetchedAt >= 60 * 60_000) {
+      await this.loadTunnelProfile(this.state.selectedSubscriptionId).catch(() => {});
+    }
     if (now - this.lastAccountCheckAt >= ACCOUNT_CHECK_INTERVAL_MS) await this.checkAccount();
     if (!this.liveEvents?.active) this.startLiveEvents();
     if (now - this.lastHomeRoadAt >= HOME_ROAD_REFRESH_MS) this.refreshHomeRoadSoon();
@@ -1547,6 +1555,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
   private serviceProfileFor(server: TunnelServer): PreparedTunnelProfile {
     if (!this.profile) throw new Error("Профиль не загружен");
     const profile = { ...this.profile };
+    if (server.id.startsWith("external:")) { delete profile.serviceRoutes; return { ...profile, servers: [server] }; }
     if (!profile.serviceRoutes && !this.serviceRouteState.enrolled(profile.subscriptionId)) return profile;
     const key = serviceServerKey(server);
     const policy = key && !this.serviceRouteState.excluded(profile.subscriptionId, key)
@@ -1561,6 +1570,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
   private async refreshServiceRoutePolicy(server: TunnelServer): Promise<boolean> {
     if (this.guestConnection.active) return false;
     const profile = this.profile;
+    if (server.id.startsWith("external:")) return false;
     if (this.serviceRoutesRollback || !profile || !this.accessToken) return false;
     await this.serviceRouteState.load().catch(() => {});
     if (!profile.serviceRoutes && !this.serviceRouteState.enrolled(profile.subscriptionId)
@@ -2256,6 +2266,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     this.sentPresence = null;
     this.accessToken = null;
     this.profile = null;
+    this.externalSelected = null;
     this.lastServiceRouteReport = null;
     this.patch({ serviceRoutes: null, serviceRouteNotice: null, serviceRouteDetails: [] });
     this.lastConfig = null;
@@ -2436,7 +2447,49 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     this.lastRawUpload = 0;
   }
 
+  private externalSelected: TunnelServer | null = null;
+  private externalProfileFetchedAt = 0;
+
+  private async selectExternalRoute(): Promise<boolean> {
+    const profile = this.profile;
+    if (!profile || !profile.externalPool?.servers.length) throw new Error("Нет сохранённого списка безлимитных серверов. Обновите подписку при доступном интернете.");
+    if (profile.subscriptionExpiresAt && Date.parse(profile.subscriptionExpiresAt) <= Date.now()) throw new Error("Срок подписки истёк");
+    const abort = new AbortController();
+    this.routeProbeAbort?.abort(); this.routeProbeAbort = abort;
+    const intent = this.connectionIntent;
+    const saved = this.externalSelected?.id;
+    const servers = [...profile.externalPool.servers].sort((a, b) => Number(b.id === saved) - Number(a.id === saved));
+    this.patch({ status: "connecting", busy: true, statusDetail: "Проверяем интернет через безлимитные серверы…" });
+    try {
+      const winner = await findExternalServer({ servers, signal: abort.signal,
+        progress: (externalPoolProgress) => { if (!abort.signal.aborted) this.patch({ externalPoolProgress }); },
+        verify: async (server, signal) => {
+          const session = await openRouteProbe(this.xray.executablePath(), {
+            id: server.id, routeKey: server.id, tag: server.tag,
+            config: this.routeProbeSource(server),
+          }, signal);
+          try { return await session.verifyData?.() === true; } finally { await session.close(); }
+        },
+      });
+      if (abort.signal.aborted || intent !== this.connectionIntent || profile !== this.profile) return false;
+      if (!winner) throw new Error("Проверили сохранённые серверы: ни один не передаёт трафик. Обновите список или повторите позже.");
+      this.externalSelected = winner;
+      return true;
+    } catch (error) {
+      if (abort.signal.aborted) return false;
+      this.patch({ status: "error", statusDetail: messageOf(error) });
+      throw error;
+    } finally {
+      if (this.routeProbeAbort === abort) {
+        this.routeProbeAbort = null;
+        this.patch({ externalPoolProgress: null, busy: false,
+          ...(abort.signal.aborted && !this.xray.isRunning() ? { status: "disconnected" as const, statusDetail: null } : {}) });
+      }
+    }
+  }
+
   private selectedServer(): TunnelServer | null {
+    if (this.state.selectedServerId === EXTERNAL_AUTO_ID) return this.externalSelected;
     return this.state.servers.find((item) => item.id === this.state.selectedServerId)
       ?? this.bestServer(this.state.servers)
       ?? null;
@@ -2677,7 +2730,7 @@ export class AppController extends EventEmitter<AppControllerEvents> {
 
   /** Servers the automatic choice may take. */
   private automaticCandidates(servers: TunnelServer[]): TunnelServer[] {
-    servers = servers.filter((server) => !server.trustTunnel);
+    servers = servers.filter((server) => !server.trustTunnel && server.id !== EXTERNAL_AUTO_ID);
     // A home exit («🏠») is only ever the user's own choice.
     const ordinary = servers.filter((item) => !isHomeRoadServer(item.name));
     const offered = ordinary.length ? ordinary : servers;

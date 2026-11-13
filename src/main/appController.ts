@@ -40,7 +40,7 @@ import type { PreparedTunnelProfile } from "./vpn/tunnelProfile";
 import { buildXrayConfig } from "./vpn/xrayConfig";
 import { XrayManager } from "./vpn/xrayManager";
 import { measureServerLatencies, extractServerEndpoint } from "./vpn/serverPinger";
-import { EXTERNAL_AUTO_ID, retainExternalPool, findExternalServer } from "./vpn/externalPool";
+import { EXTERNAL_AUTO_ID, retainExternalPool, removeDesktopExternalPool, findExternalServer } from "./vpn/externalPool";
 import { openRouteProbe, measureRouteCandidates, measuredRouteUsable, type RouteMeasurement, type RouteProbeCandidate } from "./vpn/routeProbe";
 import type { LiveAutoUpdate } from "./vpn/smartAutoLiveRuntime";
 import { FAILED_TRAFFIC_CHECK_MS, isTunnelHealthy, measureTraffic } from "./vpn/tunnelHealth";
@@ -2205,6 +2205,11 @@ export class AppController extends EventEmitter<AppControllerEvents> {
     if (!raw) return null;
     try {
       const value = JSON.parse(raw.toString("utf8")) as PreparedTunnelProfile;
+      if (Array.isArray(value.servers) && removeDesktopExternalPool(value)) {
+        await this.secureStore.put("tunnel_profile", Buffer.from(JSON.stringify(value)));
+        const selected = await this.loadString("selected_server");
+        if (selected === EXTERNAL_AUTO_ID || selected?.startsWith("external:")) await this.secureStore.remove("selected_server");
+      }
       const serviceRoutes = parseServiceRoutePolicy(value.serviceRoutes);
       const good = this.serviceRouteState.good(value.subscriptionId) ?? serviceRoutes;
       if (good) value.serviceRoutes = good;
